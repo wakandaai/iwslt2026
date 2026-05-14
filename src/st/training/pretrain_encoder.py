@@ -1,36 +1,89 @@
 """
 Stage 1: Pretrain speech encoder with CTC loss.
 
-Step-based training with resume support. Specify total_steps, save_every_steps,
-log_every_steps, eval_every_steps. Epoch count is derived and reported.
+Step-based training with DDP support and resume. Saved checkpoints include
+full model state + optimizer + scheduler + vocab, so Stage 2/3 can load
+directly via load_encoder_from_checkpoint().
 
-Usage:
-    python -m st.training.pretrain_encoder --config configs/experiment/pretrain_ctc.yaml
-    python -m st.training.pretrain_encoder --config configs/experiment/pretrain_ctc.yaml \
+Single GPU:
+    python -m st.training.pretrain_ctc \
+        --config configs/experiment/pretrain_ctc.yaml
+
+Multi-GPU (torchrun):
+    torchrun --standalone --nproc_per_node=4 \
+        -m st.training.pretrain_ctc \
+        --config configs/experiment/pretrain_ctc.yaml
+
+Resume:
+    torchrun --standalone --nproc_per_node=4 \
+        -m st.training.pretrain_ctc \
+        --config configs/experiment/pretrain_ctc.yaml \
         --resume_from checkpoints/encoder/encoder_step50000.pt
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
+import os
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-import wandb
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from st.models.speech_encoder import SpeechEncoder
-from st.data import SpeechDataset, ASRCollator, BalancedSampler, build_vocab_from_index, build_dataset
-from st.utils.audio import build_feature_extractor
+from st.data.dataset import SpeechDataset
+from st.data.sampler import DurationBucketSampler
+from st.data.vocab import build_vocab_from_index, save_vocab, load_vocab
+from st.models.encoder import SpeechEncoder, load_encoder_from_checkpoint
 from st.utils.config import load_config
+from st.utils.metrics import compute_wer
 from st.utils.schedulers import build_scheduler
+from st.utils.ddp_utils import setup_ddp, teardown_ddp, reduce_tensor, barrier
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
+
+# ============================================================================
+# CTC collator
+# ============================================================================
+
+def ctc_collate(batch: list[dict], vocab: dict[str, int]) -> dict[str, torch.Tensor]:
+    """Pad mel features and encode transcripts as CTC integer sequences."""
+    mel_lens = torch.tensor([b["mel_len"] for b in batch], dtype=torch.long)
+    max_mel  = int(mel_lens.max().item())
+    mel_pad  = torch.zeros(len(batch), max_mel, 80)
+    for i, b in enumerate(batch):
+        mel_pad[i, : b["mel_len"]] = b["mel"]
+
+    labels:        list[torch.Tensor] = []
+    label_lengths: list[int]          = []
+    for b in batch:
+        encoded = [vocab[c] for c in b["transcript"] if c in vocab]
+        labels.append(torch.tensor(encoded, dtype=torch.long))
+        label_lengths.append(len(encoded))
+
+    max_lab = max(label_lengths) if label_lengths else 1
+    lab_pad = torch.zeros(len(batch), max_lab, dtype=torch.long)
+    for i, lab in enumerate(labels):
+        lab_pad[i, : lab.size(0)] = lab
+
+    return {
+        "features":        mel_pad,
+        "feature_lengths": mel_lens,
+        "labels":          lab_pad,
+        "label_lengths":   torch.tensor(label_lengths, dtype=torch.long),
+    }
+
+
+# ============================================================================
+# Validation  (master rank only)
+# ============================================================================
 
 @torch.no_grad()
 def validate(
@@ -41,365 +94,462 @@ def validate(
     step: int = 0,
     output_dir: Path | None = None,
 ) -> dict[str, float]:
-    """Run validation: compute CTC loss and greedy WER. Saves predictions CSV."""
     model.eval()
     ctc_loss_fn = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    total_loss = 0.0
-    num_batches = 0
-
     idx_to_char = {v: k for k, v in vocab.items()}
-    all_preds = []
-    all_refs = []
+
+    total_loss, n_batches = 0.0, 0
+    preds: list[str] = []
+    refs:  list[str] = []
 
     for batch in loader:
-        features = batch["features"].to(device)
+        features        = batch["features"].to(device)
         feature_lengths = batch["feature_lengths"].to(device)
-        labels = batch["labels"].to(device)
-        label_lengths = batch["label_lengths"].to(device)
+        labels          = batch["labels"].to(device)
+        label_lengths   = batch["label_lengths"].to(device)
 
-        out = model(features, feature_lengths)
+        out      = model(features, feature_lengths)
         log_probs = out["ctc_logits"].log_softmax(dim=-1).transpose(0, 1)
-        loss = ctc_loss_fn(log_probs, labels, out["lengths"], label_lengths)
+        loss     = ctc_loss_fn(log_probs, labels, out["lengths"], label_lengths)
 
         total_loss += loss.item()
-        num_batches += 1
+        n_batches  += 1
 
-        preds = out["ctc_logits"].argmax(dim=-1)
-        for i in range(preds.size(0)):
-            pred_ids = preds[i, : out["lengths"][i]].tolist()
-            decoded = []
-            prev = -1
-            for idx in pred_ids:
-                if idx != 0 and idx != prev:
-                    decoded.append(idx_to_char.get(idx, ""))
-                prev = idx
-            all_preds.append("".join(decoded))
+        # Greedy decode
+        pred_ids = out["ctc_logits"].argmax(dim=-1)
+        for i in range(pred_ids.size(0)):
+            seq = pred_ids[i, : out["lengths"][i]].tolist()
+            decoded, prev = [], -1
+            for tid in seq:
+                if tid != 0 and tid != prev:
+                    decoded.append(idx_to_char.get(tid, ""))
+                prev = tid
+            preds.append("".join(decoded))
+            ref_seq = labels[i, : label_lengths[i]].tolist()
+            refs.append("".join(idx_to_char.get(t, "") for t in ref_seq))
 
-            ref_ids = labels[i, : label_lengths[i]].tolist()
-            all_refs.append("".join(idx_to_char.get(idx, "") for idx in ref_ids))
-
-    avg_loss = total_loss / max(num_batches, 1)
-
-    from st.utils.metrics import compute_wer
-    wer = compute_wer(all_preds, all_refs) if all_refs else 0.0
+    avg_loss = total_loss / max(n_batches, 1)
+    wer      = compute_wer(preds, refs) if refs else 0.0
 
     if output_dir is not None:
-        import csv
-        from jiwer import wer as jiwer_wer
+        output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / f"val_preds_step{step}.csv"
-        with open(csv_path, "w", newline="") as f:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["reference", "prediction", "wer"])
-            for ref, pred in zip(all_refs, all_preds):
-                if ref.strip():
-                    sample_wer = jiwer_wer(ref, pred) if pred.strip() else 1.0
-                else:
-                    sample_wer = 0.0 if not pred.strip() else 1.0
-                writer.writerow([ref, pred, f"{sample_wer:.4f}"])
-        n_empty = sum(1 for p in all_preds if not p.strip())
-        logger.info(
-            f"Val predictions saved to {csv_path} "
-            f"({len(all_preds)} total, {n_empty} empty predictions)"
-        )
+            writer.writerow(["reference", "prediction"])
+            for r, p in zip(refs, preds):
+                writer.writerow([r, p])
+        n_empty = sum(1 for p in preds if not p.strip())
+        log.info(f"Val preds saved → {csv_path} ({n_empty} empty)")
 
     model.train()
     return {"val/ctc_loss": avg_loss, "val/wer": wer}
 
 
-def infinite_loader(loader: DataLoader):
-    """Wrap a DataLoader to restart automatically — yields batches forever."""
-    while True:
-        yield from loader
+# ============================================================================
+# Checkpoint helpers
+# ============================================================================
+
+def save_checkpoint(
+    model: SpeechEncoder,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    step: int,
+    vocab: dict[str, int],
+    enc_cfg: dict,
+    output_dir: Path,
+) -> Path:
+    """Save a full training checkpoint. Call on master rank only."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = output_dir / f"encoder_step{step}.pt"
+    torch.save(
+        {
+            "step":                 step,
+            "model_state_dict":     model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "vocab":                vocab,
+            "encoder_config":       enc_cfg,
+        },
+        ckpt_path,
+    )
+    log.info(f"Checkpoint → {ckpt_path}")
+    return ckpt_path
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="checkpoints/encoder")
-    parser.add_argument("--resume_from", type=str, default=None,
-                        help="Path to checkpoint to resume from")
-    args = parser.parse_args()
+def load_checkpoint(
+    model: SpeechEncoder,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    path: str,
+    device: torch.device,
+) -> int:
+    """Load checkpoint into raw (unwrapped) model. Returns step."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    step = ckpt.get("step", 0)
+    log.info(f"Resumed from {path} at step {step}")
+    return step
 
-    config = load_config(args.config)
-    encoder_cfg = config.get("encoder", {})
-    training_cfg = config.get("training", {})
-    data_cfg = config.get("data", {})
 
-    logging.basicConfig(level=logging.INFO)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ============================================================================
+# Training
+# ============================================================================
 
-    # --- Data ---
-    index_paths = data_cfg["index_paths"]
-    if isinstance(index_paths, str):
-        index_paths = [index_paths]
+def train(cfg: dict, resume_from: str | None = None) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
-    lowercase = data_cfg.get("lowercase", False)
+    # ---- DDP setup ----
+    is_ddp, rank, local_rank, world_size, device_str = setup_ddp()
+    master = rank == 0
+    device = torch.device(device_str)
 
-    dataset = build_dataset(
-        index_paths=index_paths,
-        target_sample_rate=data_cfg.get("sample_rate", 16000),
-        text_column="transcript",
-        split=data_cfg.get("split", "train"),
-        languages=data_cfg.get("languages", None),
-        sources=data_cfg.get("sources", None),
+    if master:
+        log.info(
+            f"DDP: {'enabled' if is_ddp else 'disabled'} | "
+            f"rank={rank} | world_size={world_size} | device={device_str}"
+        )
+
+    enc_cfg   = cfg["encoder"]
+    train_cfg = cfg["training"]
+    data_cfg  = cfg["data"]
+    output_dir = Path(train_cfg.get("output_dir", "checkpoints/encoder"))
+
+    if master:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Vocab (all ranks need it for the collator) ----
+    vocab_path = data_cfg.get("vocab_path")
+    if vocab_path and os.path.exists(vocab_path):
+        vocab = load_vocab(vocab_path)
+    else:
+        # Only master builds and saves; then all ranks load
+        if master:
+            vocab = build_vocab_from_index(
+                data_cfg["train_index"],
+                text_column="transcript",
+                split=data_cfg.get("train_split", "train"),
+                languages=data_cfg.get("languages"),
+                lowercase=data_cfg.get("lowercase", False),
+            )
+            if vocab_path:
+                save_vocab(vocab, vocab_path)
+        # Non-master ranks wait until master has written the file
+        barrier()
+        if not master:
+            vocab = load_vocab(vocab_path) if vocab_path else build_vocab_from_index(
+                data_cfg["train_index"],
+                text_column="transcript",
+                split=data_cfg.get("train_split", "train"),
+                languages=data_cfg.get("languages"),
+                lowercase=data_cfg.get("lowercase", False),
+            )
+
+    if master:
+        log.info(f"Vocab: {len(vocab)} tokens")
+
+    # ---- Datasets ----
+    train_ds = SpeechDataset(
+        index_path=data_cfg["train_index"],
+        split=data_cfg.get("train_split", "train"),
+        task="asr",
+        languages=data_cfg.get("languages"),
         max_duration=data_cfg.get("max_duration", 30.0),
         min_duration=data_cfg.get("min_duration", 0.1),
-        lowercase=lowercase,
+        lowercase=data_cfg.get("lowercase", False),
     )
 
-    # Build vocab
-    vocab = build_vocab_from_index(
-        index_paths[0],
-        text_column="transcript",
-        split=data_cfg.get("split", "train"),
-        languages=data_cfg.get("languages", None),
-        lowercase=lowercase,
-    )
-    for extra_path in index_paths[1:]:
-        extra_vocab = build_vocab_from_index(
-            extra_path,
-            text_column="transcript",
-            split=data_cfg.get("split", "train"),
-            languages=data_cfg.get("languages", None),
-            lowercase=lowercase,
+    # Validation dataset and loader: master rank only
+    val_loader = None
+    if master and data_cfg.get("val_index"):
+        val_ds = SpeechDataset(
+            index_path=data_cfg["val_index"],
+            split=data_cfg.get("val_split", "dev"),
+            task="asr",
+            languages=data_cfg.get("languages"),
+            max_duration=data_cfg.get("max_duration", 30.0),
+            lowercase=data_cfg.get("lowercase", False),
         )
-        for char in extra_vocab:
-            if char not in vocab:
-                vocab[char] = len(vocab)
 
-    logger.info(f"Vocabulary size: {len(vocab)}")
+        def collate_fn(batch):
+            return ctc_collate(batch, vocab)
 
-    # --- Model ---
+        val_sampler = DurationBucketSampler(
+            dataset=val_ds,
+            target_duration=train_cfg.get("max_batch_duration", 240.0),
+            max_batch_size=train_cfg.get("val_batch_size", 16),
+            shuffle=False,
+            shuffle_buckets=False,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_sampler=val_sampler,
+            num_workers=train_cfg.get("num_workers", 4),
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+
+    # ---- Model ----
     model = SpeechEncoder(
-        input_dim=encoder_cfg.get("input_dim", 80),
-        encoder_dim=encoder_cfg.get("encoder_dim", 512),
-        num_heads=encoder_cfg.get("num_heads", 8),
-        ffn_dim=encoder_cfg.get("ffn_dim", 2048),
-        num_layers=encoder_cfg.get("num_layers", 12),
-        depthwise_conv_kernel_size=encoder_cfg.get("depthwise_conv_kernel_size", 31),
-        dropout=encoder_cfg.get("dropout", 0.1),
+        input_dim=enc_cfg.get("input_dim", 80),
+        encoder_dim=enc_cfg.get("encoder_dim", 512),
+        num_heads=enc_cfg.get("num_heads", 8),
+        ffn_dim=enc_cfg.get("ffn_dim", 2048),
+        num_layers=enc_cfg.get("num_layers", 12),
+        depthwise_conv_kernel_size=enc_cfg.get("depthwise_conv_kernel_size", 31),
+        dropout=enc_cfg.get("dropout", 0.1),
         vocab_size=len(vocab),
     ).to(device)
 
-    logger.info(f"Encoder parameters: {sum(p.numel() for p in model.parameters()):,}")
+    if master:
+        log.info(f"Encoder: {sum(p.numel() for p in model.parameters()):,} params")
 
-    # --- DataLoader ---
-    feature_extractor = build_feature_extractor(
-        sample_rate=data_cfg.get("sample_rate", 16000),
-        n_mels=encoder_cfg.get("input_dim", 80),
-    )
-    collator = ASRCollator(feature_extractor=feature_extractor, vocab=vocab)
-
-    sampler = None
-    shuffle = True
-    balance_by = data_cfg.get("balance_by", None)
-    if balance_by and isinstance(dataset, SpeechDataset):
-        sampler = BalancedSampler(
-            dataset,
-            group_by=balance_by,
-            samples_per_group=data_cfg.get("samples_per_group", None),
-        )
-        shuffle = False
-
-    batch_size = training_cfg.get("batch_size", 16)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=training_cfg.get("num_workers", 4),
-        collate_fn=collator,
-        pin_memory=True,
-    )
-
-    # --- Val DataLoader ---
-    val_dataset = build_dataset(
-        index_paths=index_paths,
-        target_sample_rate=data_cfg.get("sample_rate", 16000),
-        text_column="transcript",
-        split="dev",
-        languages=data_cfg.get("languages", None),
-        sources=data_cfg.get("sources", None),
-        max_duration=data_cfg.get("max_duration", 30.0),
-        min_duration=data_cfg.get("min_duration", 0.1),
-        lowercase=lowercase,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=training_cfg.get("num_workers", 4),
-        collate_fn=collator,
-        pin_memory=True,
-    )
-    logger.info(f"Val dataset: {len(val_dataset)} samples")
-
-    # --- Step budget ---
-    total_steps = training_cfg["total_steps"]
-    save_every = training_cfg.get("save_every_steps", 10000)
-    log_every = training_cfg.get("log_every_steps", 100)
-    eval_every = training_cfg.get("eval_every_steps", 5000)
-
-    steps_per_epoch = len(loader)
-    equiv_epochs = total_steps / steps_per_epoch if steps_per_epoch > 0 else 0
-    logger.info(
-        f"Training for {total_steps:,} steps "
-        f"(~{equiv_epochs:.1f} epochs, {steps_per_epoch:,} steps/epoch, "
-        f"batch_size={batch_size})"
-    )
-
-    # --- Optimizer + Scheduler ---
+    # ---- Optimizer + Scheduler ----
+    total_steps = train_cfg["total_steps"]
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=training_cfg.get("lr", 1e-4),
-        weight_decay=training_cfg.get("weight_decay", 0.01),
+        lr=float(train_cfg.get("lr", 1e-4)),
+        weight_decay=train_cfg.get("weight_decay", 0.01),
     )
-
-    sched_cfg = training_cfg.get("scheduler", {})
+    # Flat scheduler keys — same layout as stage 2/3/4/5 configs.
+    # `scheduler` key is just the name string (e.g. "cosine_warmup_restarts").
     scheduler = build_scheduler(
-        name=sched_cfg.get("name", "none"),
+        name=train_cfg.get("scheduler", "cosine_warmup_restarts"),
         optimizer=optimizer,
         total_steps=total_steps,
-        **{k: v for k, v in sched_cfg.items() if k != "name"},
+        max_lr=float(train_cfg.get("lr", 1e-4)),
+        min_lr=float(train_cfg.get("min_lr", 1e-6)),
+        warmup_steps=train_cfg.get("warmup_steps", 2000),
+        first_cycle_steps=train_cfg.get("first_cycle_steps", total_steps),
+        gamma=train_cfg.get("gamma", 1.0),
     )
-    if scheduler is not None:
-        logger.info(f"Scheduler: {sched_cfg['name']}")
 
-    # --- Resume from checkpoint ---
+    # ---- Resume (all ranks load so state is identical) ----
     start_step = 0
-    if args.resume_from is not None:
-        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        start_step = ckpt.get("step", 0)
-        logger.info(f"Resumed from {args.resume_from} at step {start_step}")
+    if resume_from:
+        start_step = load_checkpoint(model, optimizer, scheduler, resume_from, device)
 
-    # --- wandb ---
-    wandb_cfg = config.get("wandb", {})
-    if wandb_cfg.get("enabled", False):
-        wandb.init(
-            project=wandb_cfg.get("project", "iwslt2026-st"),
-            name=wandb_cfg.get("name", "pretrain-encoder"),
-            tags=wandb_cfg.get("tags", []),
-            config={
-                **config,
-                "_steps_per_epoch": steps_per_epoch,
-                "_equiv_epochs": round(equiv_epochs, 2),
-                "_resumed_from_step": start_step,
-            },
-            save_code=False,
-            resume="allow" if start_step > 0 else None,
-        )
-    else:
-        wandb.init(mode="disabled")
+    # ---- Wrap with DDP after loading weights ----
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank])
 
-    # --- Training loop (step-based) ---
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_model: SpeechEncoder = model.module if is_ddp else model
 
-    ctc_loss_fn = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    model.train()
+    # ---- Train sampler + loader ----
+    def collate_fn(batch):
+        return ctc_collate(batch, vocab)
 
-    running_loss = 0.0
-    log_steps = 0
-    t_start = time.time()
-
-    remaining_steps = total_steps - start_step
-    pbar = tqdm(
-        total=remaining_steps,
-        desc="Training",
-        unit="step",
-        initial=0,
+    train_sampler = DurationBucketSampler(
+        dataset=train_ds,
+        target_duration=train_cfg.get("max_batch_duration", 240.0),
+        max_batch_size=train_cfg.get("max_batch_size", 32),
+        shuffle=True,
+        shuffle_buckets=True,
+        rank=rank,
+        world_size=world_size,
+        seed=42,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_sampler=train_sampler,
+        num_workers=train_cfg.get("num_workers", 4),
+        collate_fn=collate_fn,
+        pin_memory=True,
     )
 
-    for step_offset, batch in enumerate(infinite_loader(loader), start=1):
-        step = start_step + step_offset
+    if master:
+        log.info(
+            f"Train: {len(train_ds)} samples, {len(train_sampler)} batches/epoch "
+            f"(world_size={world_size}, effective_batch ≈ "
+            f"{train_cfg.get('max_batch_duration', 240.0) * world_size:.0f}s/step)"
+        )
 
-        features = batch["features"].to(device)
-        feature_lengths = batch["feature_lengths"].to(device)
-        labels = batch["labels"].to(device)
-        label_lengths = batch["label_lengths"].to(device)
-
-        out = model(features, feature_lengths)
-        log_probs = out["ctc_logits"].log_softmax(dim=-1).transpose(0, 1)
-        loss = ctc_loss_fn(log_probs, labels, out["lengths"], label_lengths)
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-
-        running_loss += loss.item()
-        log_steps += 1
-        pbar.update(1)
-
-        # --- Logging ---
-        if step % log_every == 0:
-            avg_loss = running_loss / log_steps
-            elapsed = time.time() - t_start
-            samples_sec = (log_steps * batch_size) / elapsed
-            current_epoch = step / steps_per_epoch if steps_per_epoch > 0 else 0
-
-            pbar.set_postfix(loss=avg_loss, lr=optimizer.param_groups[0]["lr"], epoch=current_epoch)
-
-            if wandb.run is not None:
-                wandb.log({
-                    "train/ctc_loss": avg_loss,
-                    "train/lr": optimizer.param_groups[0]["lr"],
-                    "train/epoch": current_epoch,
-                    "train/samples_per_sec": samples_sec,
-                }, step=step)
-
-            running_loss = 0.0
-            log_steps = 0
-            t_start = time.time()
-
-        # --- Validation ---
-        if step % eval_every == 0:
-            val_metrics = validate(model, val_loader, device, vocab, step=step, output_dir=output_dir)
-            logger.info(
-                f"Step {step:,} — val_loss: {val_metrics['val/ctc_loss']:.4f}, "
-                f"val_wer: {val_metrics['val/wer']:.4f}"
+    # ---- W&B (master only) ----
+    use_wandb = cfg.get("wandb", {}).get("enabled", False) and master
+    if use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=cfg["wandb"].get("project", "iwslt2026"),
+                name=cfg["wandb"].get("name", "pretrain-ctc"),
+                config=cfg,
+                resume="allow" if start_step > 0 else None,
             )
-            if wandb.run is not None:
-                wandb.log(val_metrics, step=step)
+            log.info(f"W&B: {wandb.run.url}")
+        except ImportError:
+            use_wandb = False
 
-        # --- Checkpoint ---
-        if step % save_every == 0:
-            current_epoch = step / steps_per_epoch if steps_per_epoch > 0 else 0
-            ckpt_path = output_dir / f"encoder_step{step}.pt"
-            torch.save({
-                "step": step,
-                "epoch": current_epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-                "vocab": vocab,
-                "config": encoder_cfg,
-            }, ckpt_path)
-            logger.info(f"Saved checkpoint: {ckpt_path} (epoch ~{current_epoch:.2f})")
+    # ---- Training loop ----
+    ctc_loss_fn = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+    log_every   = train_cfg.get("log_every_steps", 200)
+    save_every  = train_cfg.get("save_every_steps", 10000)
+    eval_every  = train_cfg.get("eval_every_steps", 5000)
 
-        if step >= total_steps:
-            break
+    model.train()
+    global_step   = start_step
+    epoch         = 0
+    running_loss  = 0.0
+    log_steps     = 0
+
+    pbar = tqdm(
+        total=total_steps - start_step,
+        desc="CTC pretrain",
+        unit="step",
+        dynamic_ncols=True,
+        disable=not master,
+    )
+
+    if master:
+        log.info(f"Training for {total_steps} steps (resuming from {start_step})")
+
+    while global_step < total_steps:
+        epoch += 1
+        train_sampler.set_epoch(epoch)
+
+        for batch in train_loader:
+            if global_step >= total_steps:
+                break
+
+            features        = batch["features"].to(device)
+            feature_lengths = batch["feature_lengths"].to(device)
+            labels          = batch["labels"].to(device)
+            label_lengths   = batch["label_lengths"].to(device)
+
+            out      = model(features, feature_lengths)
+            log_probs = out["ctc_logits"].log_softmax(dim=-1).transpose(0, 1)
+            loss     = ctc_loss_fn(log_probs, labels, out["lengths"], label_lengths)
+
+            optimizer.zero_grad()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+
+            global_step   += 1
+            cur_bs         = features.size(0)
+            cur_dur        = feature_lengths.sum().item() * 0.01  # frames → seconds (10ms hop)
+            running_loss  += loss.item()
+            log_steps     += 1
+
+            if master:
+                pbar.update(1)
+                pbar.set_postfix(
+                    loss=f"{loss.item():.3f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.1e}",
+                    gnorm=f"{grad_norm:.2f}",
+                    ep=epoch,
+                )
+
+            # ---- Logging ----
+            if global_step % log_every == 0:
+                # Reduce loss across ranks so the logged value is the true mean
+                loss_tensor = loss.detach().clone()
+                reduce_tensor(loss_tensor)   # all ranks participate; non-master discards
+
+                if master:
+                    avg = running_loss / log_steps
+                    lr  = optimizer.param_groups[0]["lr"]
+
+                    log.info(
+                        f"step {global_step:,}/{total_steps:,} | "
+                        f"ctc_loss={avg:.4f} | lr={lr:.2e} | "
+                        f"gnorm={grad_norm:.2f} | bs={cur_bs} | dur={cur_dur:.0f}s"
+                    )
+                    if use_wandb:
+                        import wandb
+                        wandb.log(
+                            {
+                                "train/ctc_loss":          avg,
+                                "train/lr":                lr,
+                                "train/epoch":             epoch,
+                                "train/grad_norm":         grad_norm,
+                                "train/batch_size":        cur_bs * world_size,
+                                "train/batch_dur_s":       cur_dur * world_size,
+                            },
+                            step=global_step,
+                        )
+                    running_loss = 0.0
+                    log_steps    = 0
+
+            # ---- Checkpoint (master only) ----
+            if master and global_step % save_every == 0:
+                save_checkpoint(
+                    raw_model, optimizer, scheduler,
+                    global_step, vocab, enc_cfg, output_dir,
+                )
+
+            # ---- Validation (master only) ----
+            if master and val_loader is not None and global_step % eval_every == 0:
+                metrics = validate(
+                    raw_model, val_loader, device, vocab,
+                    step=global_step, output_dir=output_dir,
+                )
+                log.info(
+                    f"step {global_step:,} | "
+                    + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+                )
+                if use_wandb:
+                    import wandb
+                    wandb.log(metrics, step=global_step)
+                model.train()
 
     pbar.close()
 
-    # --- Save final ---
-    final_epoch = total_steps / steps_per_epoch if steps_per_epoch > 0 else 0
-    torch.save({
-        "step": total_steps,
-        "epoch": final_epoch,
-        "model_state_dict": model.state_dict(),
-        "vocab": vocab,
-        "config": encoder_cfg,
-    }, output_dir / "encoder_final.pt")
-    logger.info(f"Training complete. Final checkpoint saved ({total_steps:,} steps, ~{final_epoch:.1f} epochs)")
+    # ---- Final checkpoint ----
+    if master:
+        final_path = output_dir / "encoder_final.pt"
+        torch.save(
+            {
+                "step":             total_steps,
+                "model_state_dict": raw_model.state_dict(),
+                "vocab":            vocab,
+                "encoder_config":   enc_cfg,
+            },
+            final_path,
+        )
+        log.info(f"Final checkpoint → {final_path}")
 
-    wandb.finish()
+        if val_loader is not None:
+            metrics = validate(
+                raw_model, val_loader, device, vocab,
+                step=global_step, output_dir=output_dir,
+            )
+            log.info("Final val | " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+            if use_wandb:
+                import wandb
+                wandb.log(metrics, step=global_step)
+
+        if use_wandb:
+            import wandb
+            wandb.finish()
+
+    barrier()
+    teardown_ddp()
+
+    if master:
+        log.info("Training complete.")
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Stage 1: CTC encoder pretraining")
+    parser.add_argument("--config",      required=True,  help="Experiment YAML config")
+    parser.add_argument("--resume_from", default=None,   help="Checkpoint .pt to resume from")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    train(cfg, resume_from=args.resume_from)
 
 
 if __name__ == "__main__":

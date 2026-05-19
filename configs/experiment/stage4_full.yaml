@@ -1,6 +1,4 @@
-# Stage 4: Full fine-tuning (encoder + projector + full LLM).
-# Use a much lower LR than Stage 3 — all 1B+ params are trainable.
-# Typically run after Stage 3 to refine a strong checkpoint.
+# Stage 4: SpeechLLM
 
 encoder:
   input_dim: 80
@@ -10,11 +8,11 @@ encoder:
   num_layers: 18
   depthwise_conv_kernel_size: 31
   dropout: 0.1
-  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/encoder_final.pt
-  vocab_size: 218           # match Stage 1 vocab size for CTC compressor
+  checkpoint: runs/stage1_23_lang/encoder_step96000.pt
+  vocab_size: 925
 
 aura:
-  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.safetensors
   tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
   size: 1b
 
@@ -31,58 +29,69 @@ ctc_compress:
   blank_id: 0
 
 data:
-  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
-  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX_V2.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX_V2.csv
   train_split: train
   val_split:   dev
   languages:
-    - igbo
-    - yoruba
-    - hausa
+    - afrikaans
+    - amharic
+    - arabic
     - bemba
-  max_duration: 20.0
+    - english
+    - french
+    - hausa
+    - igbo
+    - kinyarwanda
+    - lingala
+    - luganda
+    - malagasy
+    - portuguese
+    - shona
+    - somali
+    - sotho
+    - swahili
+    - tigrinya
+    - tswana
+    - wolof
+    - xhosa
+    - yoruba
+    - zulu
+  max_duration: 30.0
   lowercase: true
-  vocab_path: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/vocab.json
+  vocab_path: /ocean/projects/cis250145p/shared/checkpoints/conformer_encoder/vocab.json
 
 training:
-  task: transcribe
-  output_dir: runs/stage4_full
+  task: asr
+  output_dir: runs/stage4_23_lang_full
+  val_samples_per_lang: 50
 
-  val_samples_per_lang: 100
-
-  projector_checkpoint: runs/stage2/checkpoint_step6000
-  # encoder_checkpoint:
-
+  projector_checkpoint: runs/stage2_23_lang/checkpoint_step32407
   unfreeze_encoder: true
   unfreeze_llm: true
   lora_rank: 0
 
-  ctc_weight: 0.2
+  ctc_weight: 0.1
 
-  max_steps: 20000
+  max_steps: 32407
   lr: 5.0e-5
   min_lr: 1.0e-7
-  warmup_steps: 500
-  first_cycle_steps: 10000
-  gamma: 0.5
+  warmup_steps: 2000
+  first_cycle_steps: 32407
+  gamma: 1.0
   scheduler: cosine_warmup_restarts
   weight_decay: 0.01
-  grad_accum: 4
+  grad_accum: 1
 
   max_batch_duration: 240.0
   max_batch_size: 96
-  max_seq_len: 1024
-  num_workers: 8
+  max_target_tokens: 256
+  num_workers: 4
 
   log_every: 50
   save_every: 2000
-  eval_every: 2000
+  eval_every: 4000
 
   no_wandb: false
-  wandb_project: iwslt2026
-  wandb_run_name: stage4_full_finetune
-
-wandb:
-  enabled: true
-  project: iwslt2026
-  name: stage4-full
+  wandb_project: speech_aura
+  wandb_run_name: stage4-full-finetuning

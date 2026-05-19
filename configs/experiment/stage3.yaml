@@ -10,7 +10,7 @@ encoder:
   depthwise_conv_kernel_size: 31
   dropout: 0.1
   checkpoint: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/encoder_final.pt
-  vocab_size: 218           # match Stage 1 vocab size for CTC compressor
+  vocab_size: 925
 
 aura:
   checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
@@ -18,73 +18,82 @@ aura:
   size: 1b
 
 projector:
-  type: transformer        # mlp | transformer
+  type: transformer
   num_layers: 2
   num_heads: 8
   dropout: 0.1
 
 ctc_compress:
   enabled: true
-  strategy: avg            # avg | weighted | softmax
+  strategy: avg
   remove_blanks: true
   blank_id: 0
 
 data:
-  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
-  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX_V2.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX_V2.csv
   train_split: train
   val_split:   dev
   languages:
-    - igbo
-    - yoruba
-    - hausa
+    - afrikaans
+    - amharic
+    - arabic
     - bemba
-  max_duration: 20.0
+    - english
+    - french
+    - hausa
+    - igbo
+    - kinyarwanda
+    - lingala
+    - luganda
+    - malagasy
+    - portuguese
+    - shona
+    - somali
+    - sotho
+    - swahili
+    - tigrinya
+    - tswana
+    - wolof
+    - xhosa
+    - yoruba
+    - zulu
+  max_duration: 30.0
   lowercase: true
-  vocab_path: checkpoints/encoder/vocab.json
+  vocab_path: /ocean/projects/cis250145p/shared/checkpoints/conformer_encoder/vocab.json
 
 training:
-  task: transcribe         # transcribe | translate
-  output_dir: runs/stage3
+  task: transcribe
+  output_dir: runs/stage3_23_lang
+  val_samples_per_lang: 100
 
-  # Stage 3 freeze config
   unfreeze_encoder: false
   unfreeze_llm: false
   lora_rank: 16
   lora_alpha: 32
   lora_targets: [q_proj, v_proj]
 
-  # Auxiliary CTC loss
-  ctc_weight: 0.3          # 0.0 = disabled
+  ctc_weight: 0.0
 
-  # Optimization
-  max_steps: 50000
-  lr: 2e-4
-  min_lr: 1e-6
-  warmup_steps: 1000
-  first_cycle_steps: 50000
+  max_steps: 32407
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+  first_cycle_steps: 32407
   gamma: 1.0
   scheduler: cosine_warmup_restarts
   weight_decay: 0.01
-  grad_accum: 8
+  grad_accum: 1
 
-  # Batching
-  max_batch_duration: 120.0
-  max_batch_size: 64
-  max_seq_len: 1024
+  max_batch_duration: 240.0
+  max_batch_size: 96
+  max_target_tokens: 256
   num_workers: 4
 
-  # Logging
-  log_every: 100
-  save_every: 5000
-  eval_every: 5000
+  log_every: 50
+  save_every: 2000
+  eval_every: 4000
 
-  # W&B
   no_wandb: false
-  wandb_project: iwslt2026
-  wandb_run_name: stage3_transformer_proj_ctc_compress
-
-wandb:
-  enabled: true
-  project: iwslt2026
-  name: pretrain-ctc
+  wandb_project: speech_aura
+  wandb_run_name: stage3-lora

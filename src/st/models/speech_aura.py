@@ -84,6 +84,10 @@ class SpeechAura(nn.Module):
                 "ctc_weight > 0 requires encoder to have a CTC head (vocab_size must be set). "
                 "Load the encoder checkpoint with vocab_size from Stage 1."
             )
+        
+        if self.ctc_weight == 0.0 and encoder.ctc_head is not None:
+            for p in encoder.ctc_head.parameters():
+                p.requires_grad = False
 
         # CTC compressor (optional)
         self.ctc_compressor: CTCCompressor | None = build_ctc_compressor(ctc_compress_cfg)

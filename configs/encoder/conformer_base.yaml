@@ -1,8 +1,0 @@
-# Conformer base — matches existing conformer_base.yaml
-input_dim: 80
-encoder_dim: 512
-num_heads: 8
-ffn_dim: 2048
-num_layers: 12
-depthwise_conv_kernel_size: 31
-dropout: 0.1

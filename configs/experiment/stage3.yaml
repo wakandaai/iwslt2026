@@ -3,14 +3,14 @@
 
 encoder:
   input_dim: 80
-  encoder_dim: 768
-  num_heads: 12
-  ffn_dim: 3072
+  encoder_dim: 1024
+  num_heads: 16
+  ffn_dim: 4096
   num_layers: 18
   depthwise_conv_kernel_size: 31
   dropout: 0.1
-  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/encoder_large/encoder_final.pt
-  vocab_size: 925
+  checkpoint: runs/stage1_20_lang/encoder_final.pt
+  vocab_size: 828
 
 aura:
   checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
@@ -26,16 +26,15 @@ projector:
 ctc_compress:
   enabled: true
   strategy: avg
-  remove_blanks: true
+  remove_blanks: false
   blank_id: 0
 
 data:
-  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX_V2.csv
-  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX_V2.csv
+  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX_V3.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX_V3.csv
   train_split: train
   val_split:   dev
   languages:
-    - afrikaans
     - amharic
     - arabic
     - bemba
@@ -54,7 +53,6 @@ data:
     - swahili
     - tigrinya
     - tswana
-    - wolof
     - xhosa
     - yoruba
     - zulu
@@ -75,12 +73,12 @@ training:
 
   ctc_weight: 0.0
 
-  max_steps: 32407
+  max_steps: 36202
   lr: 1.0e-4
   min_lr: 1.0e-6
   warmup_steps: 2000
-  first_cycle_steps: 32407
-  gamma: 1.0
+  first_cycle_steps: 36202
+  gamma: 0.8
   scheduler: cosine_warmup_restarts
   weight_decay: 0.01
   grad_accum: 1

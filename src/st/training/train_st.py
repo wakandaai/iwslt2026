@@ -116,6 +116,12 @@ def build_model(cfg: dict) -> SpeechAura:
         freeze_llm=freeze_llm,
     )
 
+    # Gradient checkpointing on the LLM — trades ~30% throughput for
+    # ~30-50% lower activation memory. Useful for stage 4 (full fine-tune).
+    if train_cfg.get("gradient_checkpointing", False):
+        aura.model.gradient_checkpointing_enable()
+        log.info("Gradient checkpointing enabled on Aura LLM")
+
     # Load projector checkpoint if specified
     proj_ckpt = train_cfg.get("projector_checkpoint")
     if proj_ckpt:
@@ -776,20 +782,16 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
             oom_this_step = False
             try:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                        enabled=(device.type == "cuda")):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
                     out  = model(**batch)
                     loss = out["loss"] / grad_accum
-                loss.backward()
-
             except torch.cuda.OutOfMemoryError:
                 oom_this_step = True
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 gc.collect()
-                torch.cuda.empty_cache()
 
-            # Synchronize OOM across all ranks — if any rank OOM'd, all skip
+            # Sync OOM BEFORE backward
             if is_ddp:
                 oom_tensor = torch.tensor(int(oom_this_step), dtype=torch.int32, device=device)
                 dist.all_reduce(oom_tensor, op=dist.ReduceOp.MAX)
@@ -804,9 +806,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 micro_step = (micro_step // grad_accum) * grad_accum
                 running = {k: 0.0 for k in running}
                 run_n = 0
-                # The OOM'd batch was drawn from the sampler — count it as consumed.
                 batches_in_epoch += 1
                 continue
+
+            # Only reach backward if no rank OOM'd
+            loss.backward()
 
             # Accumulate unscaled metrics
             for k in ("loss", "ce_loss", "ctc_loss"):

@@ -10,3 +10,4 @@ Aura-1B/
 .pytest_cache/
 dist/
 build/
+exports/

@@ -72,8 +72,8 @@ class SpeechDataset(Dataset):
         sample_rate: int = _DEFAULT_SR,
         lowercase: bool = False,
     ):
-        if task not in ("asr", "cot"):
-            raise ValueError(f"task must be 'asr' or 'cot', got '{task}'")
+        if task not in ("asr", "cot", "st"):
+            raise ValueError(f"task must be 'asr', 'cot', or 'st', got '{task}'")
 
         self.task = task
         self.sample_rate = sample_rate
@@ -114,7 +114,7 @@ class SpeechDataset(Dataset):
         )
 
         # Only needed in CoT mode — skip allocating for ASR-only runs.
-        if task == "cot":
+        if task in ("cot", "st"):
             self._translations  = np.array(
                 [e.get("translation", "") for e in entries],
                 dtype=object,
@@ -219,7 +219,8 @@ class SpeechDataset(Dataset):
                     continue
 
                 # CoT requires both transcript and translation populated
-                if task == "cot":
+                # Also enforced for ST to validate encoder
+                if task in ("cot", "st"):
                     transcript  = row.get("transcript",  "").strip()
                     translation = row.get("translation", "").strip()
                     if not transcript or not translation:
@@ -289,7 +290,7 @@ class SpeechDataset(Dataset):
         if self.task == "asr":
             translation  = ""
             tgt_language = src_language
-        else:  # cot
+        else:  # cot or st
             translation = self._translations[idx]
             if self.lowercase:
                 translation = translation.lower()

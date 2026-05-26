@@ -287,14 +287,16 @@ class TestSequenceAssembly:
             torch.randn(1, N, D), torch.tensor([N]),
             torch.tensor([[100, 101, 102, 103]]), torch.tensor([L_t]),
             torch.zeros(1, 1, dtype=torch.long), torch.tensor([0]),
-            tgt_languages=["igbo"], tasks=["asr"],
+            src_languages=["igbo"], tgt_languages=["igbo"], tasks=["asr"],
             device=torch.device("cpu"),
         )
-        # length = 3 + N + 1 + L_t = 13; prompt_len = 8
-        assert labels.shape == (1, 13)
-        expected = torch.full((13,), -100, dtype=torch.long)
-        expected[8:12] = torch.tensor([100, 101, 102, 103])
-        expected[12] = 1  # eos
+        # Layout: [BOS, audio×N, <|transcribe|>, SRC_LANG, transcript]
+        # length = 3 + N + L_t = 12; prompt_len = 2 + N = 7
+        # lab[7..10] = transcript; lab[11] = EOS
+        assert labels.shape == (1, 12)
+        expected = torch.full((12,), -100, dtype=torch.long)
+        expected[7:11] = torch.tensor([100, 101, 102, 103])
+        expected[11] = 1  # eos
         assert torch.equal(labels[0], expected)
 
     def test_cot_label_alignment(self):
@@ -304,35 +306,87 @@ class TestSequenceAssembly:
             torch.randn(1, N, D), torch.tensor([N]),
             torch.tensor([[100, 101, 102]]), torch.tensor([L_t]),
             torch.tensor([[200, 201]]), torch.tensor([L_r]),
-            tgt_languages=["english"], tasks=["cot"],
+            src_languages=["igbo"], tgt_languages=["english"], tasks=["cot"],
             device=torch.device("cpu"),
         )
-        # length = 3 + N + 1 + L_t + 1 + L_r = 15; prompt_len = 8
+        # Layout: [BOS, audio×N, <|transcribe|>, SRC_LANG, transcript,
+        #         <|translate|>, TGT_LANG, translation]
+        # length = 5 + N + L_t + L_r = 15; prompt_len = 2 + N = 7
         assert labels.shape == (1, 15)
         expected = torch.full((15,), -100, dtype=torch.long)
-        expected[8:11]  = torch.tensor([100, 101, 102])  # transcript
-        expected[11]    = 15                               # TRANSLATE_START
+        expected[7:10]  = torch.tensor([100, 101, 102])  # transcript at prompt_len..prompt_len+L_t
+        expected[10]    = 15                               # TRANSLATE_START at prompt_len+L_t
+        # Position 11 is TGT_LANG: english = LANG_MAP["english"] = 8
+        expected[11]    = 8                                # TGT_LANG
         expected[12:14] = torch.tensor([200, 201])         # translation
         expected[14]    = 1                                # eos
         assert torch.equal(labels[0], expected)
 
     def test_cot_predicting_positions(self):
-        """Embedding at position prompt_len+L_t (which is supervised against TLS)
-        must be the last transcript token's embedding."""
+        """Embeddings at supervised positions must be the previous token's embedding."""
         model = _MockSpeechAura()
         N, L_t, L_r, D = 5, 3, 2, 128
         embeds, labels, _ = model._build_inputs(
             torch.randn(1, N, D), torch.tensor([N]),
             torch.tensor([[100, 101, 102]]), torch.tensor([L_t]),
             torch.tensor([[200, 201]]), torch.tensor([L_r]),
-            tgt_languages=["english"], tasks=["cot"],
+            src_languages=["igbo"], tgt_languages=["english"], tasks=["cot"],
             device=torch.device("cpu"),
         )
-        # Position 11: embedding should be t3=102, label should be TLS=15
+        # prompt_len = 7, so transcript spans 7..9 and TLS sits at position 10.
+        # Position 10: embedding is t3=102 (last transcript token), label is TLS=15.
         t3_emb = model.aura._embed(torch.tensor([102])).squeeze(0)
-        assert torch.allclose(embeds[0, 11], t3_emb)
-        assert labels[0, 11].item() == 15
-        # Position 12: embedding should be TLS, label should be r1=200
+        assert torch.allclose(embeds[0, 10], t3_emb)
+        assert labels[0, 10].item() == 15
+        # Position 11: embedding is TLS, label is TGT_LANG.
         tls_emb = model.aura._embed(torch.tensor([15])).squeeze(0)
-        assert torch.allclose(embeds[0, 12], tls_emb)
+        assert torch.allclose(embeds[0, 11], tls_emb)
+        assert labels[0, 11].item() == 8   # english
+        # Position 12: embedding is TGT_LANG, label is r1=200.
+        tgt_emb = model.aura._embed(torch.tensor([8])).squeeze(0)
+        assert torch.allclose(embeds[0, 12], tgt_emb)
         assert labels[0, 12].item() == 200
+
+    def test_st_label_alignment(self):
+        """ST layout: [BOS, TGT_LANG, audio×N, <|translate|>, translation]"""
+        model = _MockSpeechAura()
+        N, L_r, D = 5, 3, 128
+        embeds, labels, _ = model._build_inputs(
+            torch.randn(1, N, D), torch.tensor([N]),
+            torch.zeros(1, 1, dtype=torch.long), torch.tensor([0]),  # no transcript used
+            torch.tensor([[200, 201, 202]]), torch.tensor([L_r]),
+            src_languages=["english"],
+            tgt_languages=["swahili"],
+            tasks=["st"],
+            device=torch.device("cpu"),
+        )
+        # length = 3 + N + L_r = 11
+        # positions: 0=BOS, 1=TGT_LANG, 2..6=audio, 7=<|translate|>, 8..10=translation
+        # translate_pos = 2 + N = 7
+        # lab[7..9] = translation; lab[10] = EOS
+        assert labels.shape == (1, 11)
+        expected = torch.full((11,), -100, dtype=torch.long)
+        expected[7:10] = torch.tensor([200, 201, 202])
+        expected[10] = 1  # eos
+        assert torch.equal(labels[0], expected)
+
+    def test_st_predicting_positions(self):
+        """The <|translate|> embedding at position 2+N must predict the first
+        translation token."""
+        model = _MockSpeechAura()
+        N, L_r, D = 5, 3, 128
+        embeds, labels, _ = model._build_inputs(
+            torch.randn(1, N, D), torch.tensor([N]),
+            torch.zeros(1, 1, dtype=torch.long), torch.tensor([0]),
+            torch.tensor([[200, 201, 202]]), torch.tensor([L_r]),
+            src_languages=["english"],
+            tgt_languages=["swahili"],
+            tasks=["st"],
+            device=torch.device("cpu"),
+        )
+        # Position 7: embedding is <|translate|>, label is r1=200
+        translate_emb = model.aura._embed(torch.tensor([15])).squeeze(0)
+        assert torch.allclose(embeds[0, 7], translate_emb)
+        assert labels[0, 7].item() == 200
+        # Position 1: embedding is TGT_LANG (swahili — needs LANG_MAP, mock uses english=8)
+        # Skip detailed check — mock doesn't import LANG_MAP fully.

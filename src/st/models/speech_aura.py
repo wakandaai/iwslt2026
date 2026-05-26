@@ -205,8 +205,8 @@ class SpeechAura(nn.Module):
             n_t     = int(transcript_lengths[i].item())
             n_r     = int(translation_lengths[i].item())
             task    = tasks[i]
-            if task not in ("asr", "cot"):
-                raise ValueError(f"Unknown task '{task}' (expected 'asr' or 'cot')")
+            if task not in ("asr", "cot", "st"):
+                raise ValueError(f"Unknown task '{task}' (expected 'asr', 'cot', or 'st')")
 
             src_lang_id = LANG_MAP.get(src_languages[i], LANG_MAP["eng"])
             tgt_lang_id = LANG_MAP.get(tgt_languages[i], LANG_MAP["eng"])
@@ -237,7 +237,7 @@ class SpeechAura(nn.Module):
                     lab[prompt_len : prompt_len + n_t] = transcript
                 lab[prompt_len + n_t] = self.aura.eos_id
 
-            else:  # cot
+            elif task == "cot":
                 translate_emb = embed_layer(
                     torch.tensor([self.aura.translate_start_id],
                                  dtype=torch.long, device=device)
@@ -262,6 +262,38 @@ class SpeechAura(nn.Module):
                 if n_r > 0:
                     lab[prompt_len + n_t + 2 : prompt_len + n_t + 2 + n_r] = translation
                 lab[prompt_len + n_t + 2 + n_r] = self.aura.eos_id
+
+            else:  # st — direct speech translation
+                # Layout: [BOS, TGT_LANG, audio×N, <|translate|>, translation]
+                # Mirrors Aura-MT-1B SFT prompt:
+                #   [BOS, TGT_LANG, "Translate ... English: <text> Swahili:\n"]
+                # The <|translate|> structural token substitutes for the prose
+                # "Source-lang: ... Target-lang:" delimiter — no clean prose
+                # equivalent exists between audio embeddings and output text.
+                translate_emb = embed_layer(
+                    torch.tensor([self.aura.translate_start_id],
+                                dtype=torch.long, device=device)
+                )
+                tgt_lang_emb_st = embed_layer(
+                    torch.tensor([tgt_lang_id], dtype=torch.long, device=device)
+                )
+                translation = translation_ids[i, :n_r].to(device)
+                translation_emb = embed_layer(translation)
+
+                seq_emb = torch.cat([
+                    bos_emb, tgt_lang_emb_st, audio_emb, translate_emb, translation_emb,
+                ], dim=0)
+
+                # length = 3 + n_audio + n_r  (BOS + TGT_LANG + audio + <|translate|> + translation)
+                # Position of <|translate|> = 2 + n_audio; it predicts the first
+                # translation token. translation_emb[k] predicts translation[k+1] for
+                # k < n_r-1; translation_emb[n_r-1] predicts EOS.
+                S = 3 + n_audio + n_r
+                lab = torch.full((S,), -100, dtype=torch.long, device=device)
+                translate_pos = 2 + n_audio  # position of <|translate|>
+                if n_r > 0:
+                    lab[translate_pos : translate_pos + n_r] = translation
+                lab[translate_pos + n_r] = self.aura.eos_id
 
             seqs.append(seq_emb)
             labels_list.append(lab)
@@ -378,8 +410,8 @@ class SpeechAura(nn.Module):
         """
         from st.models.kvcache import KVcache
 
-        if task not in ("asr", "cot"):
-            raise ValueError(f"Unknown task '{task}' (expected 'asr' or 'cot')")
+        if task not in ("asr", "cot", "st"):
+            raise ValueError(f"Unknown task '{task}' (expected 'asr', 'cot', or 'st')")
 
         device = audio_features.device
         audio_embeds, audio_lens, _, _ = self.encode_audio(audio_features, audio_lengths)
@@ -387,24 +419,36 @@ class SpeechAura(nn.Module):
 
         embed_layer = self.aura.get_embed_layer()
         src_lang_id = LANG_MAP.get(src_lang, LANG_MAP["eng"])
+        tgt_lang_id = LANG_MAP.get(tgt_lang, LANG_MAP["eng"])
 
-        # Prompt: [BOS, audio×N, <|transcribe|>, SRC_LANG]
-        # ASR and CoT share this prefix. The model then generates the transcript;
-        # for CoT it continues with <|translate|><tgt_lang> and translation.
         bos_emb = embed_layer(
             torch.tensor([self.aura.bos_id], dtype=torch.long, device=device)
         )
         audio_emb = audio_embeds[0, :n_audio]
-        transcribe_emb = embed_layer(
-            torch.tensor([self.aura.task_asr_id], dtype=torch.long, device=device)
-        )
-        src_lang_emb = embed_layer(
-            torch.tensor([src_lang_id], dtype=torch.long, device=device)
-        )
 
-        inputs_embeds = torch.cat(
-            [bos_emb, audio_emb, transcribe_emb, src_lang_emb], dim=0
-        ).unsqueeze(0)
+        if task in ("asr", "cot"):
+            # Prompt: [BOS, audio×N, <|transcribe|>, SRC_LANG]
+            transcribe_emb = embed_layer(
+                torch.tensor([self.aura.task_asr_id], dtype=torch.long, device=device)
+            )
+            src_lang_emb = embed_layer(
+                torch.tensor([src_lang_id], dtype=torch.long, device=device)
+            )
+            inputs_embeds = torch.cat(
+                [bos_emb, audio_emb, transcribe_emb, src_lang_emb], dim=0
+            ).unsqueeze(0)
+        else:  # st
+            # Prompt: [BOS, TGT_LANG, audio×N, <|translate|>]
+            # Model generates translation tokens until EOS.
+            tgt_lang_emb_st = embed_layer(
+                torch.tensor([tgt_lang_id], dtype=torch.long, device=device)
+            )
+            translate_emb = embed_layer(
+                torch.tensor([self.aura.translate_start_id], dtype=torch.long, device=device)
+            )
+            inputs_embeds = torch.cat(
+                [bos_emb, tgt_lang_emb_st, audio_emb, translate_emb], dim=0
+            ).unsqueeze(0)
 
         S = inputs_embeds.size(1)
         position_ids = torch.arange(S, device=device).unsqueeze(0)
@@ -422,7 +466,8 @@ class SpeechAura(nn.Module):
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         # ASR: stop at <|translate|> (boundary into translation) or EOS.
-        # CoT: stop only at EOS — <|translate|> is part of the expected output.
+        # CoT: stop only at EOS — <|translate|> is part of the expected output mid-stream.
+        # ST:  stop only at EOS — <|translate|> is already in the prompt, won't appear again.
         stop_ids = {self.aura.eos_id}
         if task == "asr":
             stop_ids.add(self.aura.translate_start_id)

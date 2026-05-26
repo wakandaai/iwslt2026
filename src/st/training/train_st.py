@@ -245,23 +245,26 @@ def build_val_generate_indices(
     val_ds: SpeechDataset,
     samples_per_lang: int = 100,
 ) -> list[int]:
-    """Return the first `samples_per_lang` indices per language. Deterministic."""
+    """Return the first `samples_per_lang` indices per direction-pair. Deterministic."""
     from collections import defaultdict
-    lang_indices: dict[str, list[int]] = defaultdict(list)
-    # Read directly from the columnar array — avoids materializing dicts via _EntriesView
+    pair_indices: dict[tuple[str, str], list[int]] = defaultdict(list)
     src_langs = val_ds._src_languages
+    tgt_langs = val_ds._tgt_languages if val_ds._tgt_languages is not None else val_ds._src_languages
     for idx in range(len(val_ds)):
-        lang = src_langs[idx] or "?"
-        if len(lang_indices[lang]) < samples_per_lang:
-            lang_indices[lang].append(idx)
+        src = src_langs[idx] or "?"
+        tgt = tgt_langs[idx] or "?"
+        key = (src, tgt)
+        if len(pair_indices[key]) < samples_per_lang:
+            pair_indices[key].append(idx)
 
     indices: list[int] = []
-    for lang in sorted(lang_indices):
-        n = len(lang_indices[lang])
-        log.info(f"  Val generate: {n} samples for language '{lang}'")
-        indices.extend(lang_indices[lang])
+    for key in sorted(pair_indices):
+        src, tgt = key
+        n = len(pair_indices[key])
+        log.info(f"  Val generate: {n} samples for {src}→{tgt}")
+        indices.extend(pair_indices[key])
 
-    log.info(f"Val generate indices: {len(indices)} total ({len(lang_indices)} languages)")
+    log.info(f"Val generate indices: {len(indices)} total ({len(pair_indices)} direction-pairs)")
     return indices
 
 
@@ -353,13 +356,16 @@ def evaluate(
                 src_lang=sample["src_language"],
                 tgt_lang=sample["tgt_language"],
                 task=task,
-                max_new_tokens=256 if task == "cot" else 128,
+                max_new_tokens=256 if task in ("cot", "st") else 128,
             )
             if task == "asr":
                 hyp_t = model._strip_special_tokens(output).strip()
                 hyp_r = ""
-            else:
+            elif task == "cot":
                 hyp_t, hyp_r = model.split_cot_output(output)
+            else:  # st — output is translation only, no transcript in the generation
+                hyp_t = ""  # no transcript to score for ST
+                hyp_r = model._strip_special_tokens(output).strip()
         except Exception as e:
             log.warning(f"[rank {rank}] generate() failed for sample {idx}: {e}")
             hyp_t = ""
@@ -448,24 +454,49 @@ def evaluate(
             except Exception:
                 per_sample_wer.append(1.0)
 
-        results["wer"] = compute_wer(hyp_transcripts, ref_transcripts)
-        for lang in sorted(lang_hyp_t):
-            lang_wer = compute_wer(lang_hyp_t[lang], lang_ref_t[lang])
-            results[f"wer_{lang}"] = lang_wer
-            log.info(f"  val WER [{lang}]: {lang_wer:.4f} ({len(lang_hyp_t[lang])} samples)")
+        # WER on transcripts: meaningful for ASR/CoT, skipped for ST.
+        if task in ("asr", "cot"):
+            results["wer"] = compute_wer(hyp_transcripts, ref_transcripts)
+            for lang in sorted(lang_hyp_t):
+                lang_wer = compute_wer(lang_hyp_t[lang], lang_ref_t[lang])
+                results[f"wer_{lang}"] = lang_wer
+                log.info(f"  val WER [{lang}]: {lang_wer:.4f} ({len(lang_hyp_t[lang])} samples)")
 
-        if task == "cot":
+        # BLEU/chrF on translations: for CoT and ST.
+        if task in ("cot", "st"):
             results["bleu"] = compute_bleu(hyp_translations, ref_translations)["bleu"]
             results["chrf"] = compute_chrf(hyp_translations, ref_translations)["chrf"]
-            for lang in sorted(lang_hyp_r):
-                lang_bleu = compute_bleu(lang_hyp_r[lang], lang_ref_r[lang])["bleu"]
-                lang_chrf = compute_chrf(lang_hyp_r[lang], lang_ref_r[lang])["chrf"]
-                results[f"bleu_{lang}"] = lang_bleu
-                results[f"chrf_{lang}"] = lang_chrf
-                log.info(
-                    f"  val [{lang}]: BLEU={lang_bleu:.2f} chrF={lang_chrf:.2f} "
-                    f"({len(lang_hyp_r[lang])} samples)"
-                )
+
+            if task == "cot":
+                # Per source-language (target is fixed, or near-fixed, in CoT)
+                for lang in sorted(lang_hyp_r):
+                    lang_bleu = compute_bleu(lang_hyp_r[lang], lang_ref_r[lang])["bleu"]
+                    lang_chrf = compute_chrf(lang_hyp_r[lang], lang_ref_r[lang])["chrf"]
+                    results[f"bleu_{lang}"] = lang_bleu
+                    results[f"chrf_{lang}"] = lang_chrf
+                    log.info(
+                        f"  val [{lang}]: BLEU={lang_bleu:.2f} chrF={lang_chrf:.2f} "
+                        f"({len(lang_hyp_r[lang])} samples)"
+                    )
+            else:  # st — bucket by direction pair "{src}2{tgt}"
+                from collections import defaultdict
+                pair_hyp: dict[str, list[str]] = defaultdict(list)
+                pair_ref: dict[str, list[str]] = defaultdict(list)
+                for orig_idx, h_r, r_r, src in zip(
+                    sorted_idx, hyp_translations, ref_translations, src_langs_seen
+                ):
+                    tgt = val_ds._tgt_languages[orig_idx]
+                    pair_hyp[f"{src}2{tgt}"].append(h_r)
+                    pair_ref[f"{src}2{tgt}"].append(r_r)
+                for pair in sorted(pair_hyp):
+                    pair_bleu = compute_bleu(pair_hyp[pair], pair_ref[pair])["bleu"]
+                    pair_chrf = compute_chrf(pair_hyp[pair], pair_ref[pair])["chrf"]
+                    results[f"bleu_{pair}"] = pair_bleu
+                    results[f"chrf_{pair}"] = pair_chrf
+                    log.info(
+                        f"  val [{pair}]: BLEU={pair_bleu:.2f} chrF={pair_chrf:.2f} "
+                        f"({len(pair_hyp[pair])} samples)"
+                    )
 
         logged: dict[str, int] = defaultdict(int)
         for h_t, r_t, h_r, r_r, lang in zip(
@@ -542,8 +573,8 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         os.makedirs(output_dir, exist_ok=True)
 
     task = data_cfg.get("task") or train_cfg.get("task", "asr")
-    if task not in ("asr", "cot"):
-        raise ValueError(f"data.task must be 'asr' or 'cot', got '{task}'")
+    if task not in ("asr", "cot", "st"):
+        raise ValueError(f"data.task must be 'asr', 'cot', or 'st', got '{task}'")
     if master:
         log.info(f"Training task: {task}")
 

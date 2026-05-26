@@ -46,7 +46,7 @@ class AuraCollator:
 
         for i, b in enumerate(batch):
             t_ids = self.tokenizer.encode(b["transcript"], add_special_tokens=False)
-            if b["task"] == "cot":
+            if b["task"] in ("cot", "st"):
                 tr_ids = self.tokenizer.encode(b["translation"], add_special_tokens=False)
             else:
                 tr_ids = []

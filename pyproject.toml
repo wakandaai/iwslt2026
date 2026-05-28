@@ -23,10 +23,18 @@ dependencies = [
     "tqdm>=4.66.0",
 ]
 
+[project.scripts]
+speech-aura     = "st.inference.generate:main"
+ctc-encoder     = "st.inference.ctc_generate:main"
+speech-aura-mic = "st.inference.mic:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.3.0",
+]
+mic = [
+    "sounddevice>=0.4.6",
 ]
 
 [tool.setuptools.packages.find]

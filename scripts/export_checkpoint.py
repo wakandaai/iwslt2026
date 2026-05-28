@@ -8,6 +8,9 @@ Two modes:
               - encoder_config.yaml (architecture)
               - vocab.json          (CTC vocab)
               - README.md           (auto-generated stub)
+            Optionally pass --config to enrich the README with the training
+            language list + data provenance (architecture/vocab still come
+            from the checkpoint, which is authoritative for the shipped weights).
 
   speech_aura  Stage 2/3/4 SpeechAura. Packages everything needed to rebuild
                the full model offline:
@@ -24,14 +27,21 @@ Two modes:
               - aura/                   (Aura base: model.safetensors/.pt + tokenizer.json)
               - README.md
 
-The exported directory is rebuilt-from with `st.inference.generate` / 
-`st.inference.ctc_generate` after pointing the YAML's relative paths at the
-unpacked dir — the rewrite is automatic on export.
+The exported directory is consumed by the installed `st` package — install the
+repo first (`pip install git+...`), then run the bundled console commands
+(`ctc-encoder`, `speech-aura`, `speech-aura-mic`) or `python -m st.inference.*`.
+The exported config's relative paths are rewritten automatically on export.
 
 Usage:
     # Stage 1 encoder
     python scripts/export_checkpoint.py encoder \
         --checkpoint runs/stage1_23_lang/encoder_step96000.pt \
+        --output exports/ctc_encoder_23lang
+
+    # Stage 1 encoder, richer model card (languages + provenance from YAML)
+    python scripts/export_checkpoint.py encoder \
+        --checkpoint runs/stage1_23_lang/encoder_step96000.pt \
+        --config configs/experiment/stage1.yaml \
         --output exports/ctc_encoder_23lang
 
     # SpeechAura (any of stage 2/3/4)
@@ -64,6 +74,10 @@ from st.utils.config import load_config
 
 log = logging.getLogger(__name__)
 
+# Default repo URL shown in generated READMEs. Override with --repo-url so the
+# model card's pip-install line points at the right place.
+DEFAULT_REPO_URL = "https://github.com/<you>/iwslt2026"
+
 
 # ============================================================================
 # Encoder export
@@ -72,12 +86,19 @@ log = logging.getLogger(__name__)
 def export_encoder(
     checkpoint: str,
     output_dir: str,
+    config_path: str | None = None,
+    repo_url: str = DEFAULT_REPO_URL,
     overwrite: bool = False,
 ) -> Path:
     """Package a Stage 1 encoder checkpoint into a self-contained directory.
 
     The checkpoint already bundles encoder_config + vocab; this just unpacks
     them into discrete files and strips optimizer/scheduler state.
+
+    If `config_path` is given, the README is enriched with the training
+    language list and data provenance. Architecture and vocab are always
+    sourced from the checkpoint (authoritative for the shipped weights), never
+    from the YAML, to avoid drift.
     """
     out = _prepare_output_dir(output_dir, overwrite)
 
@@ -100,6 +121,24 @@ def export_encoder(
     with open(out / "vocab.json", "w", encoding="utf-8") as f:
         json.dump(ckpt["vocab"], f, ensure_ascii=False, indent=2)
 
+    # Optional enrichment from the experiment YAML — languages + provenance only.
+    languages: list[str] | None = None
+    provenance: dict | None = None
+    if config_path:
+        cfg = load_config(config_path)
+        data_cfg = cfg.get("data", {})
+        languages = data_cfg.get("languages") or data_cfg.get("src_languages")
+        provenance = {
+            "train_index":  data_cfg.get("train_index"),
+            "max_duration": data_cfg.get("max_duration"),
+            "lowercase":    data_cfg.get("lowercase"),
+            "source_config": str(config_path),
+        }
+        log.info(
+            f"Enriching README from {config_path}: "
+            f"{len(languages) if languages else 0} languages"
+        )
+
     meta = {
         "kind":         "ctc_encoder",
         "step":         ckpt.get("step"),
@@ -107,12 +146,14 @@ def export_encoder(
         "vocab_size":   len(ckpt["vocab"]),
         "encoder_dim":  ckpt["encoder_config"].get("encoder_dim"),
         "num_layers":   ckpt["encoder_config"].get("num_layers"),
+        "languages":    languages,
+        "provenance":   provenance,
         "source_checkpoint": str(checkpoint),
     }
     with open(out / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    _write_encoder_readme(out, meta)
+    _write_encoder_readme(out, meta, repo_url=repo_url)
     _log_export_summary(out)
     return out
 
@@ -126,6 +167,7 @@ def export_speech_aura(
     checkpoint_dir: str,
     output_dir: str,
     skip_aura_base: bool = False,
+    repo_url: str = DEFAULT_REPO_URL,
     overwrite: bool = False,
 ) -> Path:
     """Package a SpeechAura checkpoint + all referenced assets.
@@ -271,7 +313,7 @@ def export_speech_aura(
     with open(out / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    _write_speech_aura_readme(out, meta)
+    _write_speech_aura_readme(out, meta, repo_url=repo_url)
     _log_export_summary(out)
     return out
 
@@ -378,7 +420,28 @@ def _size_int(n: int) -> str:
     return f"{n:.1f} TB"
 
 
-def _write_encoder_readme(out: Path, meta: dict) -> None:
+def _format_language_section(languages: list[str] | None) -> str:
+    """Render a markdown language list, or a fallback pointer to vocab.json."""
+    if not languages:
+        return "(language list not recorded — pass --config on export to include it)"
+    lines = [f"- {lang}" for lang in languages]
+    return f"{len(languages)} languages:\n\n" + "\n".join(lines)
+
+
+def _write_encoder_readme(out: Path, meta: dict, repo_url: str = DEFAULT_REPO_URL) -> None:
+    lang_section = _format_language_section(meta.get("languages"))
+
+    provenance_block = ""
+    prov = meta.get("provenance")
+    if prov:
+        provenance_block = (
+            "\n## Training provenance\n\n"
+            f"- train index: `{prov.get('train_index')}`\n"
+            f"- max duration: {prov.get('max_duration')}s\n"
+            f"- lowercase: {prov.get('lowercase')}\n"
+            f"- source config: `{prov.get('source_config')}`\n"
+        )
+
     txt = f"""# CTC Encoder Checkpoint
 
 Multilingual African speech CTC encoder (IWSLT 2026).
@@ -397,7 +460,33 @@ Multilingual African speech CTC encoder (IWSLT 2026).
 - vocab_size:  {meta.get('vocab_size')}
 - step:        {meta.get('step')}
 
+## Languages
+
+{lang_section}
+{provenance_block}
 ## Usage
+
+Install the package, then run the bundled console command:
+
+```bash
+pip install git+{repo_url}
+
+# Download this checkpoint dir (or clone the HF repo), then:
+ctc-encoder --checkpoint encoder.pt --audio test.wav
+```
+
+Live from the microphone (needs the `mic` extra + system PortAudio):
+
+```bash
+pip install "iwslt2026[mic] @ git+{repo_url}"
+# conda install -c conda-forge portaudio   # if PortAudio isn't present
+speech-aura-mic encoder --checkpoint encoder.pt
+```
+
+Equivalent module form (no console script): `python -m st.inference.ctc_generate
+--checkpoint encoder.pt --audio test.wav`.
+
+Or rebuild the encoder in Python:
 
 ```python
 import json, yaml, torch
@@ -411,16 +500,13 @@ encoder = SpeechEncoder(**{{k: v for k, v in cfg.items() if k != "checkpoint"}},
 encoder.load_state_dict(torch.load("encoder.pt", weights_only=True)["model_state_dict"])
 encoder.eval()
 ```
-
-Or run inference directly:
-```
-python -m st.inference.ctc_generate --checkpoint encoder.pt --audio test.wav
-```
 """
     (out / "README.md").write_text(txt)
 
 
-def _write_speech_aura_readme(out: Path, meta: dict) -> None:
+def _write_speech_aura_readme(out: Path, meta: dict, repo_url: str = DEFAULT_REPO_URL) -> None:
+    lang_section = _format_language_section(meta.get("languages"))
+
     txt = f"""# SpeechAura Checkpoint
 
 End-to-end speech translation model (IWSLT 2026).
@@ -448,18 +534,40 @@ End-to-end speech translation model (IWSLT 2026).
 - ctc_compress: {meta.get('ctc_compress')}
 - has_lora:     {meta.get('has_lora')}
 - has_llm_full: {meta.get('has_llm_full')}
-- languages:    {meta.get('languages')}
+
+## Languages
+
+{lang_section}
 
 ## Usage
 
+Install the package first, then run from inside this directory:
+
+```bash
+pip install git+{repo_url}
+
+speech-aura --config config.yaml --checkpoint . \\
+    --audio test.wav --src_language igbo --task asr
 ```
-python -m st.inference.generate \\
-    --config config.yaml \\
-    --checkpoint . \\
-    --audio test.wav \\
-    --src_language igbo \\
-    --task asr
+
+Direct speech translation (Yoruba → English):
+
+```bash
+speech-aura --config config.yaml --checkpoint . \\
+    --audio test.wav --src_language yoruba --tgt_language english --task st
 ```
+
+Live from the microphone (needs the `mic` extra + system PortAudio):
+
+```bash
+pip install "iwslt2026[mic] @ git+{repo_url}"
+# conda install -c conda-forge portaudio   # if PortAudio isn't present
+speech-aura-mic speech_aura --config config.yaml --checkpoint . \\
+    --src-lang yoruba --tgt-lang english --task st --loop
+```
+
+Equivalent module form: `python -m st.inference.generate --config config.yaml
+--checkpoint . --audio test.wav --src_language igbo --task asr`.
 
 The config's `encoder.checkpoint`, `aura.checkpoint`, `aura.tokenizer`, and
 `data.vocab_path` are already rewritten to point at files in this directory.
@@ -482,6 +590,12 @@ def main() -> None:
     p_enc.add_argument("--checkpoint", required=True,
                        help="Stage 1 encoder .pt (must contain encoder_config + vocab)")
     p_enc.add_argument("--output",     required=True, help="Output directory")
+    p_enc.add_argument("--config",     default=None,
+                       help="Optional experiment YAML — enriches the README with the "
+                            "training language list + provenance. Architecture/vocab "
+                            "always come from the checkpoint.")
+    p_enc.add_argument("--repo-url",   default=DEFAULT_REPO_URL,
+                       help="Git URL shown in the generated README's pip-install line.")
     p_enc.add_argument("--overwrite",  action="store_true")
 
     p_sa = sub.add_parser("speech_aura", help="Export a SpeechAura (stage 2/3/4) checkpoint")
@@ -490,16 +604,24 @@ def main() -> None:
     p_sa.add_argument("--output",         required=True, help="Output directory")
     p_sa.add_argument("--skip_aura_base", action="store_true",
                       help="Don't copy Aura base weights/tokenizer (saves ~2GB)")
+    p_sa.add_argument("--repo-url",       default=DEFAULT_REPO_URL,
+                      help="Git URL shown in the generated README's pip-install line.")
     p_sa.add_argument("--overwrite",      action="store_true")
 
     args = parser.parse_args()
 
     if args.kind == "encoder":
-        export_encoder(args.checkpoint, args.output, overwrite=args.overwrite)
+        export_encoder(
+            args.checkpoint, args.output,
+            config_path=args.config,
+            repo_url=args.repo_url,
+            overwrite=args.overwrite,
+        )
     else:
         export_speech_aura(
             args.config, args.checkpoint, args.output,
             skip_aura_base=args.skip_aura_base,
+            repo_url=args.repo_url,
             overwrite=args.overwrite,
         )
 

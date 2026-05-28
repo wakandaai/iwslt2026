@@ -82,9 +82,11 @@ def run_inference(
 
     if task == "asr":
         return {"transcript": model._strip_special_tokens(output).strip()}
-    else:
+    elif task == "cot":
         transcript, translation = model.split_cot_output(output)
         return {"transcript": transcript, "translation": translation}
+    else:  # st — output is translation only, no transcript in the generation
+        return {"translation": model._strip_special_tokens(output).strip()}
 
 
 def main() -> None:
@@ -95,8 +97,8 @@ def main() -> None:
     parser.add_argument("--checkpoint",     required=True,  help="Checkpoint directory")
     parser.add_argument("--audio",          required=True,  help="Audio file path")
     parser.add_argument("--src_language",   required=True,  help="Source language code (e.g. igbo)")
-    parser.add_argument("--tgt_language", default="english", help="Target language for CoT (ignored for ASR)")
-    parser.add_argument("--task",           default="asr", choices=["asr", "cot"])
+    parser.add_argument("--tgt_language", default="english", help="Target language for cot/st (ignored for ASR)")
+    parser.add_argument("--task",           default="asr", choices=["asr", "cot", "st"])
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--device",         default="cuda")
     args = parser.parse_args()
@@ -116,12 +118,13 @@ def main() -> None:
     sep = "=" * 60
     print(f"\n{sep}")
     print(f"Audio:    {args.audio}")
-    if args.task == "cot":
-        print(f"Source: {args.src_language}  |  Target: {args.tgt_language}  |  Task: {args.task}")
-    else:
+    if args.task == "asr":
         print(f"Source: {args.src_language}  |  Task: {args.task}")
+    else:
+        print(f"Source: {args.src_language}  |  Target: {args.tgt_language}  |  Task: {args.task}")
     print(f"{sep}")
-    print(f"Transcript:  {output['transcript']}")
+    if "transcript" in output:
+        print(f"Transcript:  {output['transcript']}")
     if "translation" in output:
         print(f"Translation: {output['translation']}")
     print(f"{sep}\n")

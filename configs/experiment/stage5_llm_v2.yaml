@@ -1,0 +1,97 @@
+# Stage 4: SpeechLLM
+
+encoder:
+  input_dim: 80
+  encoder_dim: 1024
+  num_heads: 16
+  ffn_dim: 4096
+  num_layers: 18
+  depthwise_conv_kernel_size: 31
+  dropout: 0.1
+  checkpoint: runs/stage1_20_lang/encoder_step72000.pt
+  vocab_size: 828
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-MT-1B/model.safetensors
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-MT-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg
+  remove_blanks: false
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/datasets/AST_INDEX.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/AST_INDEX.csv
+  train_split: train
+  val_split:   dev
+  languages:
+    - amharic
+    - arabic
+    - bemba
+    - english
+    - french
+    - hausa
+    - igbo
+    - kinyarwanda
+    - lingala
+    - luganda
+    - malagasy
+    - portuguese
+    - shona
+    - somali
+    - sotho
+    - swahili
+    - tigrinya
+    - tswana
+    - xhosa
+    - yoruba
+    - zulu
+  max_duration: 30.0
+  lowercase: true
+  vocab_path: /ocean/projects/cis250145p/shared/checkpoints/conformer_encoder/vocab.json
+
+training:
+  task: st
+  output_dir: runs/stage5_20_lang_llm_v2
+  val_samples_per_lang: 25
+
+  projector_checkpoint: runs/stage2_20_lang_st/checkpoint_step6000
+  unfreeze_encoder: false
+  unfreeze_llm: true
+  lora_rank: 0
+
+  ctc_weight: 0.0
+
+  max_steps: 35430
+  lr: 5.0e-5
+  min_lr: 1.0e-7
+  warmup_steps: 2000
+  first_cycle_steps: 35430
+  gamma: 0.8
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+
+  grad_accum: 1
+  gradient_checkpointing: false
+
+  max_batch_duration: 240.0
+  max_batch_size: 72
+  max_target_tokens: 256
+  num_workers: 8
+
+  log_every: 50
+  save_every: 2000
+  eval_every: 2000
+
+  no_wandb: false
+  wandb_project: speech_aura
+  wandb_run_name: direct-st-v2

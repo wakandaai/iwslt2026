@@ -293,6 +293,46 @@ class AuraLLM(nn.Module):
         logits = self.model.lm_head(h).float()
         return logits
 
+    def forward_hidden(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        use_cache: bool = False,
+        cache=None,                       # core.kvcache.KVcache | None
+    ) -> torch.Tensor:
+        """Run the transformer blocks + final RMSNorm, return hidden states.
+
+        Args:
+            inputs_embeds: (B, S, hidden_size) — text/audio/frame embeddings,
+                           already assembled by the caller.
+            position_ids:  (B, S). Auto-generated contiguous if None (and, when
+                           decoding from a non-empty cache, offset by the cache
+                           length so RoPE indexes the right absolute positions).
+            use_cache:     enable KV cache (frame-level AR decoding).
+            cache:         KVcache instance when use_cache=True.
+
+        Returns:
+            h: (B, S, hidden_size) hidden states AFTER the final norm, BEFORE
+               any head. The TTS temporal→depth interface consumes h[:, t] as
+               the conditioning vector for frame t's depth-transformer step.
+        """
+        B, S, _ = inputs_embeds.shape
+        device = inputs_embeds.device
+
+        if position_ids is None:
+            if use_cache and cache is not None and len(cache.key_list[0]) > 0:
+                start = cache.key_list[0].shape[2]
+            else:
+                start = 0
+            position_ids = torch.arange(
+                start, start + S, dtype=torch.long, device=device
+            ).unsqueeze(0).expand(B, S)
+
+        h = inputs_embeds
+        for layer in self.model.model.layers:
+            h = layer(h, position_ids=position_ids, use_cache=use_cache, cache=cache)
+        return self.model.model.norm(h)
+
     # ------------------------------------------------------------------
     # Checkpoint helpers
     # ------------------------------------------------------------------

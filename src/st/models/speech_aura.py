@@ -29,12 +29,59 @@ import torch.nn.functional as F
 from st.models.encoder import SpeechEncoder
 from st.models.projector import build_projector
 from st.models.ctc_compressor import CTCCompressor, build_ctc_compressor
-from st.models.aura import (
+from core.aura import (
     AuraLLM,
     TRANSLATE_START_ID, TASK_ASR_ID, TASK_COT_ID,
     LANG_MAP,
 )
 log = logging.getLogger(__name__)
+
+
+# Prose templates aligned to Aura-MT-1B SFT (inference.py TEMPLATES), each
+# split at the {source} slot into (prefix, suffix). For ST the projected audio
+# embeddings occupy the {source} position, so the assembled layout is:
+#   [BOS, TGT_LANG, prefix, audio×N, suffix, translation, EOS]
+# The suffix ends in the exact "...{tgt}:\n" delimiter the MT model learned to
+# translate after. {src}/{tgt} are the human-readable names below.
+ST_TEMPLATE_PARTS: list[tuple[str, str]] = [
+    ("Translate the following {src} text into {tgt}.\n{src}: ", "\n{tgt}:\n"),
+    ("You are a professional translator. Translate from {src} to {tgt}.\n", "\nTranslation:\n"),
+    ("[{src}] ", "\n[{tgt}]\n"),
+    ("", "\n\nProvide a fluent {tgt} translation of the {src} text above.\n{tgt}:\n"),
+    ("Task: {src} to {tgt} translation.\nInput: ", "\nOutput:\n"),
+    ("Translate to {tgt}: ", "\n{tgt} translation:\n"),
+]
+
+# Human-readable names matching Aura-MT-1B's training prompts (inference.py
+# LANG_NAMES). Keyed like LANG_MAP so dataset strings ("igbo"), short codes
+# ("ibo") and NLLB codes ("ibo_Latn") all resolve.
+LANG_DISPLAY: dict[str, str] = {
+    "afr": "Afrikaans", "afr_Latn": "Afrikaans", "afrikaans": "Afrikaans",
+    "amh": "Amharic", "amh_Ethi": "Amharic", "amharic": "Amharic",
+    "arb": "Arabic", "arb_Arab": "Arabic", "arabic": "Arabic",
+    "bem": "Bemba", "bem_Latn": "Bemba", "bemba": "Bemba",
+    "eng": "English", "eng_Latn": "English", "english": "English",
+    "fon": "Fon", "fon_Latn": "Fon",
+    "fra": "French", "fra_Latn": "French", "french": "French",
+    "hau": "Hausa", "hau_Latn": "Hausa", "hausa": "Hausa",
+    "ibo": "Igbo", "ibo_Latn": "Igbo", "igbo": "Igbo",
+    "kin": "Kinyarwanda", "kin_Latn": "Kinyarwanda", "kinyarwanda": "Kinyarwanda",
+    "lin": "Lingala", "lin_Latn": "Lingala", "lingala": "Lingala",
+    "lug": "Luganda", "lug_Latn": "Luganda", "luganda": "Luganda",
+    "nya": "Chichewa", "nya_Latn": "Chichewa", "chichewa": "Chichewa",
+    "plt": "Malagasy", "plt_Latn": "Malagasy", "mlg": "Malagasy", "malagasy": "Malagasy",
+    "por": "Portuguese", "por_Latn": "Portuguese", "portuguese": "Portuguese",
+    "sna": "Shona", "sna_Latn": "Shona", "shona": "Shona",
+    "som": "Somali", "som_Latn": "Somali", "somali": "Somali",
+    "sot": "Sesotho", "sot_Latn": "Sesotho", "sesotho": "Sesotho", "sotho": "Sesotho", "nso": "Sesotho",
+    "swh": "Swahili", "swh_Latn": "Swahili", "swahili": "Swahili", "sw": "Swahili",
+    "tir": "Tigrinya", "tir_Ethi": "Tigrinya", "tigrinya": "Tigrinya", "tigrigna": "Tigrinya",
+    "tsn": "Setswana", "tsn_Latn": "Setswana", "tswana": "Setswana",
+    "wol": "Wolof", "wol_Latn": "Wolof", "wolof": "Wolof",
+    "xho": "Xhosa", "xho_Latn": "Xhosa", "xhosa": "Xhosa",
+    "yor": "Yoruba", "yor_Latn": "Yoruba", "yoruba": "Yoruba",
+    "zul": "Zulu", "zul_Latn": "Zulu", "zulu": "Zulu",
+}
 
 
 class SpeechAura(nn.Module):
@@ -149,6 +196,25 @@ class SpeechAura(nn.Module):
         projected = self.projector(hidden, lengths)
         return projected, lengths, ctc_logits, enc_lengths
 
+
+    def _st_prompt_ids(
+        self, src_lang: str, tgt_lang: str, template_idx: int,
+    ) -> tuple[list[int], list[int]]:
+        """Tokenize the prose prefix/suffix wrapping the audio for ST.
+
+        Mirrors Aura-MT-1B's SFT template (inference.py), with projected audio
+        embeddings standing in for the {source} text slot.
+        """
+        src_name = LANG_DISPLAY.get(src_lang, src_lang)
+        tgt_name = LANG_DISPLAY.get(tgt_lang, tgt_lang)
+        prefix_tpl, suffix_tpl = ST_TEMPLATE_PARTS[template_idx]
+        prefix = prefix_tpl.format(src=src_name, tgt=tgt_name)
+        suffix = suffix_tpl.format(src=src_name, tgt=tgt_name)
+        enc = self.aura.tokenizer.encode
+        prefix_ids = enc(prefix, add_special_tokens=False) if prefix else []
+        suffix_ids = enc(suffix, add_special_tokens=False)
+        return prefix_ids, suffix_ids
+
     # ------------------------------------------------------------------
     # Sequence assembly (called from forward and generate)
     # ------------------------------------------------------------------
@@ -165,6 +231,7 @@ class SpeechAura(nn.Module):
         tgt_languages: list[str],
         tasks: list[str],
         device: torch.device,
+        st_template_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build inputs_embeds, labels, and position_ids for the LLM.
 
@@ -263,37 +330,45 @@ class SpeechAura(nn.Module):
                     lab[prompt_len + n_t + 2 : prompt_len + n_t + 2 + n_r] = translation
                 lab[prompt_len + n_t + 2 + n_r] = self.aura.eos_id
 
-            else:  # st — direct speech translation
-                # Layout: [BOS, TGT_LANG, audio×N, <|translate|>, translation]
-                # Mirrors Aura-MT-1B SFT prompt:
-                #   [BOS, TGT_LANG, "Translate ... English: <text> Swahili:\n"]
-                # The <|translate|> structural token substitutes for the prose
-                # "Source-lang: ... Target-lang:" delimiter — no clean prose
-                # equivalent exists between audio embeddings and output text.
-                translate_emb = embed_layer(
-                    torch.tensor([self.aura.translate_start_id],
-                                dtype=torch.long, device=device)
+            else:  # st — prose-aligned to Aura-MT-1B
+                # Layout: [BOS, TGT_LANG, prefix, audio×N, suffix, translation]
+                # Audio occupies the template's {source} slot; the suffix ends
+                # in the same "...{tgt}:\n" delimiter the MT model learned to
+                # translate after. Matches inference.py build_prompt() exactly.
+                prefix_ids, suffix_ids = self._st_prompt_ids(
+                    src_languages[i], tgt_languages[i], st_template_idx
                 )
+                n_pre, n_suf = len(prefix_ids), len(suffix_ids)
+
                 tgt_lang_emb_st = embed_layer(
                     torch.tensor([tgt_lang_id], dtype=torch.long, device=device)
+                )
+                suffix_emb = embed_layer(
+                    torch.tensor(suffix_ids, dtype=torch.long, device=device)
                 )
                 translation = translation_ids[i, :n_r].to(device)
                 translation_emb = embed_layer(translation)
 
-                seq_emb = torch.cat([
-                    bos_emb, tgt_lang_emb_st, audio_emb, translate_emb, translation_emb,
-                ], dim=0)
+                pieces = [bos_emb, tgt_lang_emb_st]
+                if n_pre > 0:
+                    pieces.append(embed_layer(
+                        torch.tensor(prefix_ids, dtype=torch.long, device=device)
+                    ))
+                pieces.append(audio_emb)
+                pieces.append(suffix_emb)
+                pieces.append(translation_emb)
+                seq_emb = torch.cat(pieces, dim=0)
 
-                # length = 3 + n_audio + n_r  (BOS + TGT_LANG + audio + <|translate|> + translation)
-                # Position of <|translate|> = 2 + n_audio; it predicts the first
-                # translation token. translation_emb[k] predicts translation[k+1] for
-                # k < n_r-1; translation_emb[n_r-1] predicts EOS.
-                S = 3 + n_audio + n_r
+                # Inputs = 2 + n_pre + n_audio + n_suf + n_r. The LAST prompt
+                # token (last suffix token) predicts the first translation
+                # token; EOS is the label at the last translation-token
+                # position (no extra input slot), matching ASR/CoT convention.
+                S = 2 + n_pre + n_audio + n_suf + n_r
                 lab = torch.full((S,), -100, dtype=torch.long, device=device)
-                translate_pos = 2 + n_audio  # position of <|translate|>
+                gen_pos = 2 + n_pre + n_audio + n_suf - 1
                 if n_r > 0:
-                    lab[translate_pos : translate_pos + n_r] = translation
-                lab[translate_pos + n_r] = self.aura.eos_id
+                    lab[gen_pos : gen_pos + n_r] = translation
+                lab[gen_pos + n_r] = self.aura.eos_id
 
             seqs.append(seq_emb)
             labels_list.append(lab)
@@ -355,6 +430,7 @@ class SpeechAura(nn.Module):
             transcript_ids, transcript_lengths,
             translation_ids, translation_lengths,
             src_language, tgt_language, task, device,
+            st_template_idx=0,  # fixed template for training and inference
         )
 
         logits = self.aura(inputs_embeds, position_ids)
@@ -397,6 +473,8 @@ class SpeechAura(nn.Module):
         tgt_lang: str = "eng",
         task: str = "asr",
         max_new_tokens: int = 256,
+        return_token_ids: bool = False,
+        st_template_idx: int = 0,
     ) -> str:
         """Greedy generation.
 
@@ -408,7 +486,7 @@ class SpeechAura(nn.Module):
         For CoT the model emits <|translate|><tgt_lang> mid-stream; ASR stops
         at <|translate|> defensively.
         """
-        from st.models.kvcache import KVcache
+        from core.kvcache import KVcache
 
         if task not in ("asr", "cot", "st"):
             raise ValueError(f"Unknown task '{task}' (expected 'asr', 'cot', or 'st')")
@@ -437,18 +515,23 @@ class SpeechAura(nn.Module):
             inputs_embeds = torch.cat(
                 [bos_emb, audio_emb, transcribe_emb, src_lang_emb], dim=0
             ).unsqueeze(0)
-        else:  # st
-            # Prompt: [BOS, TGT_LANG, audio×N, <|translate|>]
-            # Model generates translation tokens until EOS.
+
+        else:  # st — prose-aligned prompt (matches _build_inputs ST layout)
+            prefix_ids, suffix_ids = self._st_prompt_ids(src_lang, tgt_lang, st_template_idx)
             tgt_lang_emb_st = embed_layer(
                 torch.tensor([tgt_lang_id], dtype=torch.long, device=device)
             )
-            translate_emb = embed_layer(
-                torch.tensor([self.aura.translate_start_id], dtype=torch.long, device=device)
+            suffix_emb = embed_layer(
+                torch.tensor(suffix_ids, dtype=torch.long, device=device)
             )
-            inputs_embeds = torch.cat(
-                [bos_emb, tgt_lang_emb_st, audio_emb, translate_emb], dim=0
-            ).unsqueeze(0)
+            pieces = [bos_emb, tgt_lang_emb_st]
+            if prefix_ids:
+                pieces.append(embed_layer(
+                    torch.tensor(prefix_ids, dtype=torch.long, device=device)
+                ))
+            pieces.append(audio_emb)
+            pieces.append(suffix_emb)
+            inputs_embeds = torch.cat(pieces, dim=0).unsqueeze(0)
 
         S = inputs_embeds.size(1)
         position_ids = torch.arange(S, device=device).unsqueeze(0)
@@ -489,7 +572,10 @@ class SpeechAura(nn.Module):
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         # NOTE: skip_special_tokens=False so TRANSLATE_START survives for split_cot_output
-        return self.aura.tokenizer.decode(generated, skip_special_tokens=False)
+        text = self.aura.tokenizer.decode(generated, skip_special_tokens=False)
+        if return_token_ids:
+            return text, generated
+        return text
 
     def split_cot_output(self, text: str) -> tuple[str, str]:
         """Split CoT decoded text into (transcript, translation) on TRANSLATE_START."""

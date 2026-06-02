@@ -11,3 +11,6 @@ Aura-1B/
 dist/
 build/
 exports/
+tts_cache/
+logs/
+models/

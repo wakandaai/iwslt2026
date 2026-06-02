@@ -54,16 +54,17 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
-from st.data import SpeechDataset, AuraCollator, DurationBucketSampler
+from st.data import SpeechDataset, AuraCollator
+from core.sampler import DurationBucketSampler
 from st.models import (
     SpeechAura, AuraLLM,
     load_encoder_from_checkpoint,
     build_ctc_compressor,
 )
-from st.utils.config import load_config
-from st.utils.schedulers import build_scheduler
+from core.utils.config import load_config
+from core.utils.schedulers import build_scheduler
 from st.utils.metrics import compute_wer, compute_bleu, compute_chrf
-from st.utils.ddp_utils import setup_ddp, teardown_ddp, reduce_tensor, barrier
+from core.utils.ddp_utils import setup_ddp, teardown_ddp, reduce_tensor, barrier
 import torch.distributed as dist
 
 log = logging.getLogger(__name__)
@@ -309,6 +310,10 @@ def evaluate(
     from tqdm import tqdm
 
     model.eval()
+    # verify nothing is in training mode
+    train_mods = [n for n, m in model.named_modules() if m.training]
+    if train_mods:
+        log.warning(f"[eval] {len(train_mods)} modules still training: {train_mods[:5]}")
     master = (rank == 0)
     results: dict[str, float] = {}
 
@@ -505,9 +510,12 @@ def evaluate(
             src_langs_seen,
         ):
             if logged[lang] < 2:
-                log.info(f"  [val {lang}] ref_t: {r_t[:80]}")
-                log.info(f"  [val {lang}] hyp_t: {h_t[:80]}")
-                if task == "cot":
+                # ASR/CoT have a transcript to show; ST doesn't.
+                if task in ("asr", "cot"):
+                    log.info(f"  [val {lang}] ref_t: {r_t[:80]}")
+                    log.info(f"  [val {lang}] hyp_t: {h_t[:80]}")
+                # CoT/ST have a translation to show.
+                if task in ("cot", "st"):
                     log.info(f"  [val {lang}] ref_r: {r_r[:80]}")
                     log.info(f"  [val {lang}] hyp_r: {h_r[:80]}")
                 logged[lang] += 1
@@ -774,6 +782,30 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             f"epoch={start_epoch}, batches_into_epoch={start_batch_in_epoch})"
         )
     optimizer.zero_grad()
+
+    # ---- Step-0 validation (baseline before any training) ----
+    # All ranks must enter — evaluate() shards generation and gathers to rank 0.
+    # Skip on resume (start_step > 0): that checkpoint already has eval history.
+    if val_ds is not None and start_step == 0:
+        if master:
+            log.info("Running step-0 validation (untrained baseline)...")
+        torch.cuda.empty_cache()
+        metrics = evaluate(
+            raw_model, val_loader, device, task,
+            val_generate_indices=val_generate_indices,
+            val_ds=val_ds,
+            rank=rank, world_size=world_size, is_ddp=is_ddp,
+            step=0, output_dir=output_dir,
+        )
+        if master:
+            log.info(
+                "step 0 val | "
+                + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+            )
+            if use_wandb:
+                import wandb
+                wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=0)
+        model.train()  # all ranks restore train mode
 
     # Outer loop: each iteration consumes one (possibly partial-on-resume) epoch.
     # We do NOT pre-increment `epoch` — the first pass replays the same epoch

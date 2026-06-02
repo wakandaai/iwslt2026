@@ -70,7 +70,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from st.utils.config import load_config
+from core.utils.config import load_config
 
 log = logging.getLogger(__name__)
 

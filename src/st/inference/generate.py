@@ -19,7 +19,7 @@ import torch
 import torchaudio
 import soundfile as sf
 
-from st.utils.config import load_config
+from core.utils.config import load_config
 
 log = logging.getLogger(__name__)
 

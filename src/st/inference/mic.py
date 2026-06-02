@@ -190,7 +190,7 @@ def run_encoder_loop(args) -> None:
 def run_speech_aura_loop(args) -> None:
     """Stage 4 SpeechAura: record → ASR / CoT / ST via the LLM."""
     from st.inference.generate import build_model_for_inference
-    from st.utils.config import load_config
+    from core.utils.config import load_config
 
     device = torch.device(
         args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"

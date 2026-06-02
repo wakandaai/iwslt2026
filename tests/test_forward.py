@@ -15,7 +15,7 @@ from st.models.encoder import SpeechEncoder, ConvSubsampler
 from st.models.projector import MLPProjector, TransformerProjector, build_projector
 from st.models.ctc_compressor import CTCCompressor, build_ctc_compressor
 from st.data.collator import AuraCollator
-from st.data.sampler import DurationBucketSampler
+from core.sampler import DurationBucketSampler
 
 
 # ============================================================================
@@ -253,9 +253,28 @@ class TestDurationBucketSampler:
             # Allow one sample to push slightly over (first sample in empty batch)
             assert total <= target + max(fake_dataset.durations)
 
+
+# ============================================================================
+# Sequence assembly — mock SpeechAura
+# ============================================================================
+#
+# These mocks let us call SpeechAura._build_inputs / _st_prompt_ids in
+# isolation, with no Aura weights. The mock tokenizer maps each character to a
+# single deterministic id, so prompt/suffix token counts are reproducible and
+# the ST tests can recompute the expected label offsets the same way the model
+# does.
+
+class _MockTok:
+    """1 deterministic id per character. ids land in [60, 110)."""
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) % 50 + 60 for c in text]
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr((i - 60) % 50 + 97) for i in ids)
+
+
 class _MockAura:
     def __init__(self, hidden_size=128):
-        import torch.nn as nn
         self.hidden_size = hidden_size
         self.bos_id = 0
         self.eos_id = 1
@@ -263,6 +282,7 @@ class _MockAura:
         self.translate_start_id = 15
         self.task_asr_id = 13
         self.task_cot_id = 14
+        self.tokenizer = _MockTok()
         self._embed = nn.Embedding(300, hidden_size)
         self._lora_layers = None
 
@@ -274,6 +294,7 @@ class _MockSpeechAura:
     def __init__(self):
         from st.models.speech_aura import SpeechAura
         self._build_inputs = SpeechAura._build_inputs.__get__(self, _MockSpeechAura)
+        self._st_prompt_ids = SpeechAura._st_prompt_ids.__get__(self, _MockSpeechAura)
         self.aura = _MockAura()
 
 
@@ -348,45 +369,66 @@ class TestSequenceAssembly:
         assert labels[0, 12].item() == 200
 
     def test_st_label_alignment(self):
-        """ST layout: [BOS, TGT_LANG, audio×N, <|translate|>, translation]"""
+        """ST: [BOS, TGT_LANG, prefix, audio×N, suffix, translation] (prose-aligned)."""
         model = _MockSpeechAura()
         N, L_r, D = 5, 3, 128
         embeds, labels, _ = model._build_inputs(
             torch.randn(1, N, D), torch.tensor([N]),
             torch.zeros(1, 1, dtype=torch.long), torch.tensor([0]),  # no transcript used
             torch.tensor([[200, 201, 202]]), torch.tensor([L_r]),
-            src_languages=["english"],
-            tgt_languages=["swahili"],
-            tasks=["st"],
-            device=torch.device("cpu"),
+            src_languages=["english"], tgt_languages=["swahili"],
+            tasks=["st"], device=torch.device("cpu"), st_template_idx=0,
         )
-        # length = 3 + N + L_r = 11
-        # positions: 0=BOS, 1=TGT_LANG, 2..6=audio, 7=<|translate|>, 8..10=translation
-        # translate_pos = 2 + N = 7
-        # lab[7..9] = translation; lab[10] = EOS
-        assert labels.shape == (1, 11)
-        expected = torch.full((11,), -100, dtype=torch.long)
-        expected[7:10] = torch.tensor([200, 201, 202])
-        expected[10] = 1  # eos
+        # Recompute the prose offsets the same way the model does.
+        pre, suf = model._st_prompt_ids("english", "swahili", 0)
+        n_pre, n_suf = len(pre), len(suf)
+        S = 2 + n_pre + N + n_suf + L_r
+        gen_pos = 2 + n_pre + N + n_suf - 1   # last prompt token predicts t_0
+
+        assert labels.shape == (1, S)
+        expected = torch.full((S,), -100, dtype=torch.long)
+        expected[gen_pos : gen_pos + L_r] = torch.tensor([200, 201, 202])
+        expected[gen_pos + L_r] = 1  # eos
         assert torch.equal(labels[0], expected)
 
     def test_st_predicting_positions(self):
-        """The <|translate|> embedding at position 2+N must predict the first
-        translation token."""
+        """Teacher forcing: the last prompt (suffix) token must predict t_0."""
         model = _MockSpeechAura()
         N, L_r, D = 5, 3, 128
         embeds, labels, _ = model._build_inputs(
             torch.randn(1, N, D), torch.tensor([N]),
             torch.zeros(1, 1, dtype=torch.long), torch.tensor([0]),
             torch.tensor([[200, 201, 202]]), torch.tensor([L_r]),
-            src_languages=["english"],
-            tgt_languages=["swahili"],
-            tasks=["st"],
-            device=torch.device("cpu"),
+            src_languages=["english"], tgt_languages=["swahili"],
+            tasks=["st"], device=torch.device("cpu"), st_template_idx=0,
         )
-        # Position 7: embedding is <|translate|>, label is r1=200
-        translate_emb = model.aura._embed(torch.tensor([15])).squeeze(0)
-        assert torch.allclose(embeds[0, 7], translate_emb)
-        assert labels[0, 7].item() == 200
-        # Position 1: embedding is TGT_LANG (swahili — needs LANG_MAP, mock uses english=8)
-        # Skip detailed check — mock doesn't import LANG_MAP fully.
+        pre, suf = model._st_prompt_ids("english", "swahili", 0)
+        gen_pos = 2 + len(pre) + N + len(suf) - 1
+
+        # Embedding at gen_pos is the LAST suffix token; its label is t_0=200.
+        last_suffix_emb = model.aura._embed(torch.tensor([suf[-1]])).squeeze(0)
+        assert torch.allclose(embeds[0, gen_pos], last_suffix_emb)
+        assert labels[0, gen_pos].item() == 200
+        # The token just before gen_pos is still prompt region (unsupervised).
+        assert labels[0, gen_pos - 1].item() == -100
+
+    def test_st_no_prefix_template(self):
+        """Template 3 has an empty prefix — assembly must still align (no audio
+        embedding gets dropped, offsets shift by n_pre=0)."""
+        model = _MockSpeechAura()
+        N, L_r, D = 4, 2, 128
+        embeds, labels, _ = model._build_inputs(
+            torch.randn(1, N, D), torch.tensor([N]),
+            torch.zeros(1, 1, dtype=torch.long), torch.tensor([0]),
+            torch.tensor([[200, 201]]), torch.tensor([L_r]),
+            src_languages=["yoruba"], tgt_languages=["english"],
+            tasks=["st"], device=torch.device("cpu"), st_template_idx=3,
+        )
+        pre, suf = model._st_prompt_ids("yoruba", "english", 3)
+        assert len(pre) == 0  # template 3 prefix is empty
+        n_suf = len(suf)
+        S = 2 + 0 + N + n_suf + L_r
+        gen_pos = 2 + 0 + N + n_suf - 1
+        assert labels.shape == (1, S)
+        assert labels[0, gen_pos : gen_pos + L_r].tolist() == [200, 201]
+        assert labels[0, gen_pos + L_r].item() == 1  # eos

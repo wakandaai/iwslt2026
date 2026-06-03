@@ -8,7 +8,7 @@ choice and context length. API:
 
 from __future__ import annotations
 
-from st.models.llama3 import ModelArgs
+from core.llama3 import ModelArgs
 
 
 # ----------------------------------------------------------------------------

@@ -1,0 +1,97 @@
+# TTS Stage 1 — train codec embeddings + depth transformer + speaker projector
+# + stop head on top of a FROZEN Aura-1B backbone.
+#
+# Targets are precomputed DAC-16kHz codes (K=12, cardinality 1024) and RawNet3
+# speaker vectors (192-d); see scripts/precompute_dac_codes.py and
+# precompute_spk_embeddings.py. Adjust the cache/index paths below to match.
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+# Model dims. n_codebooks / cardinality must match the DAC cache (validated at
+# startup against the manifest). speaker_dim is read from the speaker cache.
+tts:
+  n_codebooks: 12
+  cardinality: 1024
+  depth_dim: 1024
+  depth_layers: 6
+  depth_heads: 8
+  depth_dropout: 0.0
+  # End-of-sequence is an in-vocab code (id = cardinality, the "1025th" code),
+  # learned by the depth softmax CE — no separate stop head / stop_weight.
+  # Per-codebook CE weights (length = n_codebooks). Codebook 0 (coarsest RVQ
+  # level) dominates perceptual quality, so it's up-weighted; finer levels decay
+  # to 1.0. Set to null / remove for uniform weighting.
+  codebook_weights: [4.0, 3.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V3_16k.csv
+  val_index:   /ocean/projects/cis250145p/shared/ASR_INDEX_V3_16k.csv
+  dac_cache:   tts_cache/dac
+  spk_cache:   tts_cache/spk
+  train_split: train
+  val_split:   dev
+  languages:
+    # - amharic
+    # - arabic
+    # - bemba
+    # - english
+    # - french
+    # - hausa
+    # - igbo
+    # - kinyarwanda
+    # - lingala
+    # - luganda
+    # - malagasy
+    # - portuguese
+    # - shona
+    # - somali
+    # - sotho
+    - swahili
+    # - tigrinya
+    # - tswana
+    # - xhosa
+    # - yoruba
+    # - zulu
+  # DAC-16kHz is ~50 frames/s. Drop ultra-short clips and cap at ~30s.
+  min_frames: 8
+  max_frames: 1500
+  lowercase: true
+
+training:
+  output_dir: runs/tts_stage1
+  seed: 42
+
+  unfreeze_llm: false
+  lora_rank: 0
+  lora_alpha: 32
+  lora_targets: [q_proj, v_proj]
+  gradient_checkpointing: false
+
+  max_steps: 100000
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+  first_cycle_steps: 100000
+  gamma: 0.8
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 1
+
+  # Batches are capped on total DAC frames (the temporal sequence-length cost),
+  # not seconds — DurationBucketSampler buckets on frame count here.
+  max_batch_frames: 6000
+  max_batch_size: 32
+  max_text_tokens: 256
+  num_workers: 4
+
+  log_every: 50
+  save_every: 2000
+  eval_every: 4000
+
+wandb:
+  enabled: true
+  project: speech_aura_tts
+  name: aura_tts

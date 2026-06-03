@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from st.models.kvcache import KVcache
+from core.kvcache import KVcache
 
 try:
     from flash_attn import flash_attn_func
@@ -410,7 +410,7 @@ class LlamaTransformer(nn.Module):
         """Greedy generation with KV-cache. Sampling is handled outside; this
         method exists for quick smoke tests. SpeechAura.generate() has its own
         decode loop and does NOT call this."""
-        from st.models.kvcache import KVcache as _KV
+        from core.kvcache import KVcache as _KV
         batch_size = input_ids.shape[0]
         device = input_ids.device
         cache = _KV(self.config.n_layers)

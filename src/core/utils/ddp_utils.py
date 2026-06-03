@@ -2,7 +2,7 @@
 ddp_utils.py — Distributed Data Parallel setup utilities.
 
 Usage:
-    from st.utils.ddp_utils import setup_ddp, teardown_ddp, reduce_tensor
+    from core.utils.ddp_utils import setup_ddp, teardown_ddp, reduce_tensor
 
 Launch with torchrun:
     torchrun --standalone --nproc_per_node=4 -m st.training.train_st \

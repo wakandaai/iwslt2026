@@ -82,6 +82,12 @@ TRANSCRIPT_START_ID  = 40   # <|reserved_1|>
 TASK_ASR_ID          = 29   # <|transcribe|>
 TASK_COT_ID          = 41   # <|reserved_2|>
 TRANSLATE_START_ID   = 30   # <|translate|>
+# TTS roles. TASK_TTS uses <|synthesize|> (semantic fit). SPEECH_START has no
+# named token, so it takes a reserved slot — it marks the boundary in the
+# temporal stream where text ends and DAC frame embeddings begin (the analogue
+# of TRANSLATE_START for the acoustic side). See tts/models/speech_aura_tts.py.
+TASK_TTS_ID          = 31   # <|synthesize|>
+SPEECH_START_ID      = 42   # <|reserved_3|>
 
 
 def verify_special_token_ids(tokenizer) -> None:
@@ -97,6 +103,8 @@ def verify_special_token_ids(tokenizer) -> None:
         TASK_ASR_ID:          ("task_asr",          "<|transcribe|>"),
         TASK_COT_ID:          ("task_cot",          "<|reserved_2|>"),
         TRANSLATE_START_ID:   ("translate_start",   "<|translate|>"),
+        TASK_TTS_ID:          ("task_tts",          "<|synthesize|>"),
+        SPEECH_START_ID:      ("speech_start",      "<|reserved_3|>"),
     }
     for tok_id, (role, want) in expected.items():
         decoded = tokenizer.decode([tok_id], skip_special_tokens=False)
@@ -161,11 +169,13 @@ class AuraLLM(nn.Module):
         self.task_asr_id         = TASK_ASR_ID
         self.task_cot_id         = TASK_COT_ID
         self.translate_start_id  = TRANSLATE_START_ID
+        self.task_tts_id         = TASK_TTS_ID
+        self.speech_start_id     = SPEECH_START_ID
 
         # --- LLM ---
-        # llama3 and model_factory live in st/models/ alongside this file.
-        from st.models.llama3 import LlamaTransformer
-        from st.models.model_factory import build_model_config
+        # llama3 and model_factory live in core/ alongside this file.
+        from core.llama3 import LlamaTransformer
+        from core.model_factory import build_model_config
 
         # vocab_size: use override, else read from tokenizer. The new Aura
         # uses 64k; pad up to a multiple of 64 for efficient matmuls if not
@@ -186,6 +196,18 @@ class AuraLLM(nn.Module):
             from safetensors.torch import load_file
             state = load_file(ckpt_path, device="cpu")
         else:
+            # Legacy Aura checkpoints were pickled (weights_only=False) before
+            # llama3/model_factory moved into core/, so the embedded `config`
+            # (a ModelArgs) records top-level module names. Alias them so the
+            # unpickler resolves against their new core.* locations.
+            import sys
+            import core.kvcache
+            import core.llama3
+            import core.model_factory
+            for _legacy, _mod in (("llama3", core.llama3),
+                                  ("model_factory", core.model_factory),
+                                  ("kvcache", core.kvcache)):
+                sys.modules.setdefault(_legacy, _mod)
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             state = ckpt.get("model", ckpt)
             del ckpt

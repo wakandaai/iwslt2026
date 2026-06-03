@@ -64,11 +64,11 @@ training:
   output_dir: runs/tts_stage1
   seed: 42
 
-  unfreeze_llm: false
+  unfreeze_llm: true
   lora_rank: 0
   lora_alpha: 32
   lora_targets: [q_proj, v_proj]
-  gradient_checkpointing: false
+  gradient_checkpointing: true
 
   max_steps: 100000
   lr: 1.0e-4

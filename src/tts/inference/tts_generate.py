@@ -177,8 +177,12 @@ def run(args) -> None:
         text_ids=text_ids,
         language=args.language,
         max_frames=args.max_frames,
-        greedy=not args.sample,
+        # top_k/top_p only matter when sampling, so requesting either turns
+        # sampling on (greedy ignores them and reliably collapses to silence).
+        greedy=not (args.sample or args.top_k or args.top_p),
         temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
     )
     log.info(f"Generated {codes.size(0)} frames × {codes.size(1)} codebooks")
     if codes.size(0) == 0:
@@ -216,6 +220,10 @@ def main() -> None:
     p.add_argument("--max_frames",     type=int,   default=1500)
     p.add_argument("--sample",         action="store_true", help="Sample instead of greedy")
     p.add_argument("--temperature",    type=float, default=1.0)
+    p.add_argument("--top_k",          type=int,   default=None,
+                   help="Top-k truncation before sampling (e.g. 100). Implies --sample.")
+    p.add_argument("--top_p",          type=float, default=None,
+                   help="Nucleus (top-p) truncation before sampling (e.g. 0.9). Implies --sample.")
     p.add_argument("--device",         default="cuda")
     args = p.parse_args()
     run(args)

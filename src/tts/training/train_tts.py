@@ -177,7 +177,7 @@ def save_checkpoint(model, optimizer, scheduler, step, epoch,
 @torch.no_grad()
 def evaluate(model, val_loader, device, rank, world_size, is_ddp) -> dict[str, float]:
     model.eval()
-    sums = {"loss": 0.0, "depth_loss": 0.0}
+    sums: dict[str, float] = {}
     n = 0
     if val_loader is not None:
         for batch in val_loader:
@@ -188,21 +188,34 @@ def evaluate(model, val_loader, device, rank, world_size, is_ddp) -> dict[str, f
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=(device.type == "cuda")):
                 out = model(**batch)
-            for k in sums:
-                sums[k] += out[k].item()
+            # Accumulate every scalar the model reports (loss, depth_loss,
+            # per-codebook CE, cb0_acc, eos_recall/fpr, ...). Keys may vary per
+            # batch (EOS metrics skip empty masks), so accumulate by union.
+            for k, v in out.items():
+                if torch.is_tensor(v) and v.ndim == 0:
+                    sums[k] = sums.get(k, 0.0) + v.item()
             n += 1
 
-    # Reduce mean across ranks (sum of per-rank sums / sum of per-rank counts).
-    stats = torch.tensor([sums["loss"], sums["depth_loss"], n],
+    # Headline losses are reduced across ranks (fixed tensor layout — safe even
+    # if a rank drew zero batches). The extra diagnostic scalars (per-codebook
+    # CE, cb0_acc, EOS recall/FPR) are reported as rank-local means: the return
+    # is only consumed on master for logging, so a cross-rank reduce isn't worth
+    # the all_gather needed to align possibly-divergent key sets.
+    stats = torch.tensor([sums.get("loss", 0.0), sums.get("depth_loss", 0.0), n],
                          dtype=torch.float64, device=device)
     if is_ddp:
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     total_n = max(float(stats[2].item()), 1.0)
+    local_n = max(n, 1)
     model.train()
-    return {
+    metrics = {
         "loss":       float(stats[0].item()) / total_n,
         "depth_loss": float(stats[1].item()) / total_n,
     }
+    for k, v in sums.items():
+        if k not in metrics:
+            metrics[k] = v / local_n
+    return metrics
 
 
 # ============================================================================
@@ -439,8 +452,9 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
             loss.backward()
 
-            for k in running:
-                running[k] += out[k].item()
+            for k, v in out.items():
+                if torch.is_tensor(v) and v.ndim == 0:
+                    running[k] = running.get(k, 0.0) + v.item()
             run_n            += 1
             micro_step       += 1
             batches_in_epoch += 1

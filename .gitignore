@@ -13,4 +13,4 @@ build/
 exports/
 tts_cache/
 logs/
-models/
+models/voxcelebs12_rawnet3/

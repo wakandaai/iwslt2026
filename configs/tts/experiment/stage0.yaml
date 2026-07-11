@@ -1,0 +1,91 @@
+# TTS Stage 0 — speech-continuation pretraining (a warmup for Stage 1 TTS).
+#
+# Full fine-tune of Aura-1B + codec embeddings + depth transformer on the
+# UNCONDITIONAL next-frame objective: per utterance the temporal sequence is
+#     [BOS, LANG, SPEECH_START, frame×T]              (prompt_len = 3)
+# i.e. no speaker token, no <|synthesize|>, no text. The model learns acoustic
+# dynamics (and the in-vocab EOS stop) decoupled from text→speech alignment, so
+# the hidden states h_t are already predictive when Stage 1 adds conditioning.
+#
+# Same DAC cache and index CSV as Stage 1 (the speaker cache is still required by
+# TTSDataset for row filtering, but the speaker vectors are unused here). Hand
+# the resulting checkpoint to Stage 1 with --init_from (weights only, fresh
+# optimizer/step — NOT --resume_from, which continues this run):
+#   torchrun ... -m tts.training.train_tts --config .../stage1.yaml \
+#       --init_from runs/tts_stage0/checkpoint_step40000
+# Stage 1 then loads llm_full.pt + tts_heads.pt (backbone + codec_emb + depth
+# carry over; spk_proj re-trains, since speaker conditioning first appears there).
+#
+# Run:
+#   torchrun --standalone --nproc_per_node=4 -m tts.training.train_tts \
+#       --config configs/experiment/stage0.yaml
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+# Must match the DAC cache (validated at startup). Identical to Stage 1 so the
+# depth transformer pretrained here transfers without a shape/weighting change.
+tts:
+  n_codebooks: 12
+  cardinality: 1024
+  depth_dim: 1024
+  depth_layers: 6
+  depth_heads: 8
+  depth_dropout: 0.0
+
+data:
+  # Stage-0 switch: drop text/speaker, ride conditioning=False into forward().
+  continuation: true
+
+  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V3_16k.csv
+  val_index:   /ocean/projects/cis250145p/shared/ASR_INDEX_V3_16k.csv
+  dac_cache:   tts_cache/dac
+  spk_cache:   tts_cache/spk
+  train_split: train
+  val_split:   dev
+  languages:
+    - swahili
+  # DAC-16kHz ≈ 50 frames/s. Drop ultra-short clips; cap length (whole
+  # utterances only — ContinuationCollator drops overflow rather than cropping,
+  # so the EOS frame always marks a real utterance end).
+  min_frames: 8
+  max_frames: 1500
+  lowercase: true
+
+training:
+  output_dir: runs/tts_stage0
+  seed: 42
+
+  # Full fine-tune — the whole point of Stage 0 is to move Aura's weights into
+  # the acoustic regime. No LoRA.
+  unfreeze_llm: true
+  lora_rank: 0
+  gradient_checkpointing: true
+
+  # Warmup stage: shorter than Stage 1. Bump if the continuation loss is still
+  # falling. Gentle LR/long warmup since the text LLM is adapting to a new
+  # (acoustic) input distribution under a full fine-tune.
+  max_steps: 40000
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+  first_cycle_steps: 40000
+  gamma: 0.8
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 1
+
+  max_batch_frames: 6000
+  max_batch_size: 32
+  num_workers: 4
+
+  log_every: 50
+  save_every: 2000
+  eval_every: 4000
+
+wandb:
+  enabled: true
+  project: speech_aura_tts
+  name: speech_continuation_stage0

@@ -783,30 +783,6 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         )
     optimizer.zero_grad()
 
-    # ---- Step-0 validation (baseline before any training) ----
-    # All ranks must enter — evaluate() shards generation and gathers to rank 0.
-    # Skip on resume (start_step > 0): that checkpoint already has eval history.
-    if val_ds is not None and start_step == 0:
-        if master:
-            log.info("Running step-0 validation (untrained baseline)...")
-        torch.cuda.empty_cache()
-        metrics = evaluate(
-            raw_model, val_loader, device, task,
-            val_generate_indices=val_generate_indices,
-            val_ds=val_ds,
-            rank=rank, world_size=world_size, is_ddp=is_ddp,
-            step=0, output_dir=output_dir,
-        )
-        if master:
-            log.info(
-                "step 0 val | "
-                + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-            )
-            if use_wandb:
-                import wandb
-                wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=0)
-        model.train()  # all ranks restore train mode
-
     # Outer loop: each iteration consumes one (possibly partial-on-resume) epoch.
     # We do NOT pre-increment `epoch` — the first pass replays the same epoch
     # number we were saved in, then bumps at the bottom after the for-loop

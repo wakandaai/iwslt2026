@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 
 import torch
 import torchaudio
@@ -47,6 +48,18 @@ def audio_to_mel(waveform: torch.Tensor, sample_rate: int = 16000) -> torch.Tens
 def build_model_for_inference(cfg: dict, checkpoint: str, device: torch.device):
     """Build SpeechAura from config and load checkpoint weights."""
     from st.training.train_st import build_model
+
+    # Config asset paths are stored relative to the export directory.
+    # Anchor them to the checkpoint dir so inference works from any cwd.
+    ckpt_dir = Path(checkpoint)
+    base = ckpt_dir if ckpt_dir.is_dir() else ckpt_dir.parent
+    for section, key in (("encoder", "checkpoint"),
+                         ("aura", "checkpoint"),
+                         ("aura", "tokenizer")):
+        val = cfg.get(section, {}).get(key)
+        if val and not Path(val).is_absolute():
+            cfg[section][key] = str(base / val)
+
     model = build_model(cfg).to(device)
     model.load_checkpoint(checkpoint)
     model.eval()

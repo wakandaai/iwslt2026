@@ -475,6 +475,8 @@ class SpeechAura(nn.Module):
         max_new_tokens: int = 256,
         return_token_ids: bool = False,
         st_template_idx: int = 0,
+        no_repeat_ngram_size: int = 3,
+        repetition_penalty: float = 1.0,
     ) -> str:
         """Greedy generation.
 
@@ -482,6 +484,11 @@ class SpeechAura(nn.Module):
             src_lang: language of the audio (used in the transcript segment).
             tgt_lang: language of the translation (CoT only; ignored for ASR).
             task:     "asr" or "cot".
+            no_repeat_ngram_size: block any n-gram of this size from repeating
+                (0 disables). Prevents degenerate greedy loops on weak/OOD
+                acoustics. Default 3.
+            repetition_penalty: HF-style penalty on already-generated token
+                logits (>1 discourages repeats; 1.0 disables). Default 1.0.
 
         For CoT the model emits <|translate|><tgt_lang> mid-stream; ASR stops
         at <|translate|> defensively.
@@ -490,6 +497,29 @@ class SpeechAura(nn.Module):
 
         if task not in ("asr", "cot", "st"):
             raise ValueError(f"Unknown task '{task}' (expected 'asr', 'cot', or 'st')")
+
+        def _next_token(logits_last: torch.Tensor) -> torch.Tensor:
+            # logits_last: (1, V) float — mutated in place (fresh per step).
+            if generated and repetition_penalty != 1.0:
+                idx = torch.tensor(sorted(set(generated)), device=logits_last.device)
+                scores = logits_last[0, idx]
+                logits_last[0, idx] = torch.where(
+                    scores > 0, scores / repetition_penalty, scores * repetition_penalty
+                )
+            n = no_repeat_ngram_size
+            if n > 0 and len(generated) >= n:
+                if n == 1:
+                    banned = set(generated)
+                else:
+                    prefix = tuple(generated[-(n - 1):])
+                    banned = {
+                        generated[i + (n - 1)]
+                        for i in range(len(generated) - (n - 1))
+                        if tuple(generated[i:i + (n - 1)]) == prefix
+                    }
+                if banned:
+                    logits_last[0, list(banned)] = float("-inf")
+            return logits_last.argmax(dim=-1, keepdim=True)
 
         device = audio_features.device
         audio_embeds, audio_lens, _, _ = self.encode_audio(audio_features, audio_lengths)
@@ -546,7 +576,7 @@ class SpeechAura(nn.Module):
             logits = self.aura.model.lm_head(h).float()
 
         generated  = []
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token = _next_token(logits[:, -1, :])
 
         # ASR: stop at <|translate|> (boundary into translation) or EOS.
         # CoT: stop only at EOS — <|translate|> is part of the expected output mid-stream.
@@ -569,7 +599,7 @@ class SpeechAura(nn.Module):
                     h = layer(h, position_ids=pos, use_cache=True, cache=cache)
                 h      = self.aura.model.model.norm(h)
                 logits = self.aura.model.lm_head(h).float()
-            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_token = _next_token(logits[:, -1, :])
 
         # NOTE: skip_special_tokens=False so TRANSLATE_START survives for split_cot_output
         text = self.aura.tokenizer.decode(generated, skip_special_tokens=False)

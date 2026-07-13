@@ -76,7 +76,7 @@ log = logging.getLogger(__name__)
 
 # Default repo URL shown in generated READMEs. Override with --repo-url so the
 # model card's pip-install line points at the right place.
-DEFAULT_REPO_URL = "https://github.com/<you>/iwslt2026"
+DEFAULT_REPO_URL = "https://github.com/<you>/speechaura"
 
 
 # ============================================================================
@@ -478,7 +478,7 @@ ctc-encoder --checkpoint encoder.pt --audio test.wav
 Live from the microphone (needs the `mic` extra + system PortAudio):
 
 ```bash
-pip install "iwslt2026[mic] @ git+{repo_url}"
+pip install "speechaura[mic] @ git+{repo_url}"
 # conda install -c conda-forge portaudio   # if PortAudio isn't present
 speech-aura-mic encoder --checkpoint encoder.pt
 ```
@@ -560,7 +560,7 @@ speech-aura --config config.yaml --checkpoint . \\
 Live from the microphone (needs the `mic` extra + system PortAudio):
 
 ```bash
-pip install "iwslt2026[mic] @ git+{repo_url}"
+pip install "speechaura[mic] @ git+{repo_url}"
 # conda install -c conda-forge portaudio   # if PortAudio isn't present
 speech-aura-mic speech_aura --config config.yaml --checkpoint . \\
     --src-lang yoruba --tgt-lang english --task st --loop

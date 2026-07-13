@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "iwslt2026"
+name = "speechaura"
 version = "0.2.0"
-description = "End-to-end speech translation for IWSLT 2026 — Aura-1B backend"
+description = "End-to-end speech translation and TTS — Aura-1B backend"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

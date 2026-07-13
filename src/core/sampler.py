@@ -85,8 +85,13 @@ class DurationBucketSampler(Sampler):
         # __iter__. Reset to 0 when the epoch completes naturally.
         self._skip_batches = 0
 
-        self._buckets     = self._make_buckets()
-        self._all_batches = self._make_batches(self._buckets)
+        self._buckets = self._make_buckets()
+
+        # This rank's batches for the current epoch, built once per set_epoch.
+        # Shuffling reorders samples within a bucket, and duration-based packing
+        # depends on that order, so the batch count is only known after the
+        # shuffle — it cannot be derived from the unshuffled buckets.
+        self._epoch_batches = self._build_epoch_batches()
 
     # ------------------------------------------------------------------
 
@@ -140,7 +145,13 @@ class DurationBucketSampler(Sampler):
 
     # ------------------------------------------------------------------
 
-    def __iter__(self) -> Iterator[list[int]]:
+    def _build_epoch_batches(self) -> list[list[int]]:
+        """Build this rank's batch list for the current RNG state.
+
+        Called once per set_epoch — NOT from __iter__, so that iterating twice
+        without an intervening set_epoch replays the same batches rather than
+        advancing the shared RNG and silently desyncing the ranks.
+        """
         # Step 1: Shuffle SAMPLES within each bucket using the SHARED RNG.
         buckets = [b.copy() for b in self._buckets]
         if self.shuffle:
@@ -154,11 +165,22 @@ class DurationBucketSampler(Sampler):
         if self.shuffle_buckets:
             self._rng.shuffle(batches)
 
-        # Step 4: Slice for this rank.
-        batches = batches[self.rank::self.world_size]
+        # Step 4: Slice for this rank, then truncate to the count every rank is
+        # guaranteed to have. batches[rank::world_size] hands the low ranks an
+        # extra batch whenever the total isn't divisible by world_size, and a
+        # rank running an iteration alone blocks forever on the next collective.
+        # Equal counts are what let the training loop assume all ranks agree on
+        # micro_step (and therefore on when to sync grads). The dropped remainder
+        # is at most world_size - 1 batches, and is reshuffled back into the pool
+        # next epoch.
+        per_rank = len(batches) // self.world_size
+        return batches[self.rank::self.world_size][:per_rank]
 
-        # Step 5: Mid-epoch resume — skip already-consumed batches, then clear
-        # the counter so the NEXT epoch starts fresh.
+    def __iter__(self) -> Iterator[list[int]]:
+        batches = self._epoch_batches
+
+        # Mid-epoch resume — skip already-consumed batches, then clear the
+        # counter so the NEXT epoch starts fresh.
         if self._skip_batches > 0:
             batches = batches[self._skip_batches:]
             self._skip_batches = 0
@@ -166,10 +188,9 @@ class DurationBucketSampler(Sampler):
         yield from batches
 
     def __len__(self) -> int:
-        # Per-rank batch count. Use ceil-style division so rank 0 (which gets
-        # any remainder) doesn't under-report.
-        total = len(self._all_batches)
-        return (total + self.world_size - 1 - self.rank) // self.world_size
+        # Exact per-rank batch count for the current epoch, and identical on
+        # every rank. Must be the length __iter__ actually yields.
+        return len(self._epoch_batches)
 
     def set_epoch(self, epoch: int) -> None:
         """Call at the start of each epoch.
@@ -180,6 +201,7 @@ class DurationBucketSampler(Sampler):
         """
         self._current_epoch = epoch
         self._rng = random.Random(self.seed + epoch)
+        self._epoch_batches = self._build_epoch_batches()
 
     def skip(self, n_batches: int) -> None:
         """Skip the first n_batches of the next __iter__ call (mid-epoch resume).

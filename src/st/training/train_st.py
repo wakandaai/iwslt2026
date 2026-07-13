@@ -47,6 +47,7 @@ import csv
 import gc
 import logging
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -739,7 +740,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         try:
             import wandb
             wandb.init(
-                project=train_cfg.get("wandb_project", "iwslt2026"),
+                project=train_cfg.get("wandb_project", "speech_aura"),
                 entity=train_cfg.get("wandb_entity"),
                 name=train_cfg.get("wandb_run_name", os.path.basename(output_dir)),
                 config=cfg,
@@ -798,18 +799,24 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 )
 
         for batch in train_loader:
-            # Synchronize cooldown across ranks
-            if is_ddp and oom_cooldown > 0:
-                cooldown_tensor = torch.tensor(oom_cooldown, dtype=torch.int32, device=device)
-                dist.all_reduce(cooldown_tensor, op=dist.ReduceOp.MAX)
-                oom_cooldown = int(cooldown_tensor.item())
-
             # A batch was drawn from the sampler — advance position regardless
             # of whether we end up processing it. Two cases where we skip the
             # body but still count the batch as consumed:
             #   1. collator returned None (all samples dropped by max_target_tokens)
             #   2. we're in OOM cooldown
-            if batch is None or oom_cooldown > 0:
+            #
+            # The skip must be COLLECTIVE. `batch is None` is decided from this
+            # rank's own samples, so ranks can disagree — and a rank that skipped
+            # while another ran backward would diverge on micro_step (breaking the
+            # grad_accum no_sync agreement below) and hang the next all-reduce.
+            # MAX-reduce cooldown and the skip flag together so all ranks skip as one.
+            skip = int(batch is None or oom_cooldown > 0)
+            if is_ddp:
+                flags = torch.tensor([oom_cooldown, skip], dtype=torch.int32, device=device)
+                dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+                oom_cooldown, skip = int(flags[0].item()), int(flags[1].item())
+
+            if skip:
                 batches_in_epoch += 1
                 oom_cooldown = max(0, oom_cooldown - 1)
                 continue
@@ -848,8 +855,17 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 batches_in_epoch += 1
                 continue
 
-            # Only reach backward if no rank OOM'd
-            loss.backward()
+            # Only reach backward if no rank OOM'd.
+            # Under DDP only the micro-batch that CLOSES an accumulation window
+            # should all-reduce grads; no_sync() suppresses the reduction on the
+            # others, so we pay 1 all-reduce per optimizer step instead of
+            # grad_accum of them. micro_step is still pre-increment here, so the
+            # window closes when (micro_step + 1) hits the boundary. All ranks
+            # agree on micro_step (skip/OOM are collective), so they agree here.
+            closes_window = (micro_step + 1) % grad_accum == 0
+            sync_ctx = model.no_sync() if (is_ddp and not closes_window) else nullcontext()
+            with sync_ctx:
+                loss.backward()
 
             # Accumulate unscaled metrics
             for k in ("loss", "ce_loss", "ctc_loss"):

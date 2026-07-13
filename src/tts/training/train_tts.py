@@ -40,6 +40,7 @@ import argparse
 import gc
 import logging
 import os
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -378,7 +379,7 @@ def train(cfg: dict, resume_from: str | None = None,
         try:
             import wandb
             wandb.init(
-                project=wandb_cfg.get("project", "iwslt2026"),
+                project=wandb_cfg.get("project", "speech_aura"),
                 entity=wandb_cfg.get("entity"),
                 name=wandb_cfg.get("name", os.path.basename(output_dir)),
                 config=cfg,
@@ -422,12 +423,22 @@ def train(cfg: dict, resume_from: str | None = None,
                 log.info(f"Resuming epoch {epoch}: skipping {batches_in_epoch} batches")
 
         for batch in train_loader:
-            if is_ddp and oom_cooldown > 0:
-                ct = torch.tensor(oom_cooldown, dtype=torch.int32, device=device)
-                dist.all_reduce(ct, op=dist.ReduceOp.MAX)
-                oom_cooldown = int(ct.item())
+            # A batch was drawn from the sampler — advance position regardless of
+            # whether we process it. We skip the body when the collator returned
+            # None (all samples dropped) or we're in OOM cooldown.
+            #
+            # The skip must be COLLECTIVE. `batch is None` is decided from this
+            # rank's own samples, so ranks can disagree — and a rank that skipped
+            # while another ran backward would diverge on micro_step (breaking the
+            # grad_accum no_sync agreement below) and hang the next all-reduce.
+            # MAX-reduce cooldown and the skip flag together so all ranks skip as one.
+            skip = int(batch is None or oom_cooldown > 0)
+            if is_ddp:
+                flags = torch.tensor([oom_cooldown, skip], dtype=torch.int32, device=device)
+                dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+                oom_cooldown, skip = int(flags[0].item()), int(flags[1].item())
 
-            if batch is None or oom_cooldown > 0:
+            if skip:
                 batches_in_epoch += 1
                 oom_cooldown = max(0, oom_cooldown - 1)
                 continue
@@ -466,7 +477,14 @@ def train(cfg: dict, resume_from: str | None = None,
                 batches_in_epoch += 1
                 continue
 
-            loss.backward()
+            # Under DDP only the micro-batch that CLOSES an accumulation window
+            # all-reduces grads; no_sync() suppresses it on the others. micro_step
+            # is pre-increment here, so the window closes when (micro_step + 1)
+            # hits the boundary.
+            closes_window = (micro_step + 1) % grad_accum == 0
+            sync_ctx = model.no_sync() if (is_ddp and not closes_window) else nullcontext()
+            with sync_ctx:
+                loss.backward()
 
             for k, v in out.items():
                 if torch.is_tensor(v) and v.ndim == 0:

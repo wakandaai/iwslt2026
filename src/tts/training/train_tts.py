@@ -1,7 +1,14 @@
 """
-TTS Stage 1 — train the codec embeddings, depth transformer, speaker projector
-and stop head on top of the Aura backbone (frozen by default; LoRA / full
-fine-tune available via config).
+TTS training driver — Stage 1 (conditional TTS) and Stage 0 (speech
+continuation), selected by `data.continuation` in the config.
+
+Stage 1 trains the codec embeddings, depth transformer, speaker projector and
+stop head on top of the Aura backbone (frozen by default; LoRA / full fine-tune
+available via config). Stage 0 (data.continuation: true) is a full-FT warmup on
+the unconditional next-frame objective — no text/speaker — via
+ContinuationCollator + SpeechAuraTTS.forward(conditioning=False). The loop,
+sampler, optimizer and validation are shared; only the collator (and thus the
+prefix the model sees) differs. See configs/experiment/stage0.yaml.
 
 Mirrors st/training/train_st.py: DDP, DurationBucketSampler (keyed on DAC frame
 count, so `max_batch_duration` is a per-batch *frame* budget here), cosine
@@ -44,7 +51,7 @@ from core.sampler import DurationBucketSampler
 from core.utils.config import load_config
 from core.utils.ddp_utils import setup_ddp, teardown_ddp, reduce_tensor, barrier
 from core.utils.schedulers import build_scheduler
-from tts.data import TTSDataset, TTSCollator
+from tts.data import TTSDataset, TTSCollator, ContinuationCollator
 from tts.models import SpeechAuraTTS
 
 log = logging.getLogger(__name__)
@@ -222,7 +229,8 @@ def evaluate(model, val_loader, device, rank, world_size, is_ddp) -> dict[str, f
 # Training loop
 # ============================================================================
 
-def train(cfg: dict, resume_from: str | None = None) -> None:
+def train(cfg: dict, resume_from: str | None = None,
+          init_from: str | None = None) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -281,11 +289,21 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         model = DDP(model, device_ids=[local_rank])
     raw_model: SpeechAuraTTS = model.module if is_ddp else model
 
-    collator = TTSCollator(
-        tokenizer=raw_model.aura.tokenizer,
-        max_text_tokens=train_cfg.get("max_text_tokens", 256),
-        max_frames=data_cfg.get("max_frames"),
-    )
+    # Stage 0 (speech continuation) vs Stage 1 (TTS). The continuation collator
+    # drops text/speaker and rides conditioning=False into forward(); the rest of
+    # the loop (sampler, model(**batch), evaluate) is identical across stages.
+    continuation = data_cfg.get("continuation", False)
+    if continuation:
+        collator = ContinuationCollator(max_frames=data_cfg.get("max_frames"))
+        if master:
+            log.info("Stage 0: speech continuation (unconditional, full FT) — "
+                     "text/speaker conditioning disabled.")
+    else:
+        collator = TTSCollator(
+            tokenizer=raw_model.aura.tokenizer,
+            max_text_tokens=train_cfg.get("max_text_tokens", 256),
+            max_frames=data_cfg.get("max_frames"),
+        )
 
     frame_budget = train_cfg.get("max_batch_frames", 6000)
     train_sampler = DurationBucketSampler(
@@ -337,6 +355,16 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         gamma=train_cfg.get("gamma", 1.0),
     )
 
+    # ---- Init weights from a prior stage (weights only; fresh optimizer/step) ----
+    # This is the Stage-0 → Stage-1 handoff: load the continuation-pretrained
+    # backbone + codec_emb + depth (llm_full.pt / lora.pt + tts_heads.pt), then
+    # start a new training run. Distinct from --resume_from, which restores the
+    # optimizer/scheduler/step to continue the SAME run. Ignored when resuming.
+    if init_from and not resume_from:
+        raw_model.load_checkpoint(init_from)
+        if master:
+            log.info(f"Initialized weights from {init_from} (fresh optimizer/step)")
+
     # ---- Resume ----
     start_step = start_epoch = start_batch_in_epoch = 0
     if resume_from:
@@ -384,18 +412,6 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         log.info(f"Training for {max_steps} steps (resume step={start_step}, "
                  f"epoch={start_epoch}, batches_into_epoch={start_batch_in_epoch})")
     optimizer.zero_grad()
-
-    # ---- Step-0 validation baseline ----
-    if val_ds is not None and start_step == 0:
-        if master:
-            log.info("Running step-0 validation (untrained baseline)...")
-        metrics = evaluate(raw_model, val_loader, device, rank, world_size, is_ddp)
-        if master:
-            log.info("step 0 val | " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
-            if use_wandb:
-                import wandb
-                wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=0)
-        model.train()
 
     while global_step < max_steps:
         train_sampler.set_epoch(epoch)
@@ -555,12 +571,17 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 # ============================================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train SpeechAuraTTS (Stage 1)")
+    parser = argparse.ArgumentParser(
+        description="Train SpeechAuraTTS (Stage 1 TTS / Stage 0 continuation)")
     parser.add_argument("--config",      required=True, help="Experiment YAML config")
-    parser.add_argument("--resume_from", default=None,  help="Checkpoint dir to resume from")
+    parser.add_argument("--resume_from", default=None,
+                        help="Checkpoint dir to resume the SAME run (restores optimizer/step)")
+    parser.add_argument("--init_from", default=None,
+                        help="Checkpoint dir to init weights from for a NEW run "
+                             "(e.g. Stage-0 continuation → Stage-1 TTS)")
     args = parser.parse_args()
     cfg = load_config(args.config)
-    train(cfg, resume_from=args.resume_from)
+    train(cfg, resume_from=args.resume_from, init_from=args.init_from)
 
 
 if __name__ == "__main__":

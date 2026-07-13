@@ -195,8 +195,8 @@ class TestTTSSequenceAssembly:
         lang = "swahili"
 
         embeds, position_ids, prompt_lens = m._build_inputs(
-            codes, code_lengths, spk, text_ids, text_lengths, [lang],
-            torch.device("cpu"))
+            codes, code_lengths, [lang], torch.device("cpu"),
+            speaker_vecs=spk, text_ids=text_ids, text_lengths=text_lengths)
 
         # Layout: [BOS, SPK, synth, LANG, text×L, SPEECH_START, frame×T]
         assert prompt_lens.tolist() == [5 + L]
@@ -220,11 +220,62 @@ class TestTTSSequenceAssembly:
         m = _make_tts()
         codes = torch.randint(0, CARD, (1, 2, K))
         embeds, _, _ = m._build_inputs(
-            codes, torch.tensor([2]), torch.randn(1, SPK_DIM),
-            torch.tensor([[7]]), torch.tensor([1]), ["klingon"],
-            torch.device("cpu"))
+            codes, torch.tensor([2]), ["klingon"], torch.device("cpu"),
+            speaker_vecs=torch.randn(1, SPK_DIM),
+            text_ids=torch.tensor([[7]]), text_lengths=torch.tensor([1]))
         emb = m.aura.get_embed_layer()
         assert torch.allclose(embeds[0, 3], emb(torch.tensor([LANG_MAP["eng"]])).squeeze(0))
+
+
+class TestStage0Continuation:
+    """conditioning=False: the unconditional [BOS, LANG, SPEECH_START, frame×T]
+    prefix used to pretrain Aura + depth on speech dynamics before TTS."""
+
+    def test_continuation_prefix_layout(self):
+        m = _make_tts()
+        T = 5
+        codes = torch.randint(0, CARD, (1, T, K))
+        embeds, position_ids, prompt_lens = m._build_inputs(
+            codes, torch.tensor([T]), ["swahili"], torch.device("cpu"),
+            conditioning=False)
+
+        # Layout: [BOS, LANG, SPEECH_START, frame×T] — prompt_len = 3.
+        assert prompt_lens.tolist() == [3]
+        assert embeds.shape == (1, 3 + T, D)
+        assert torch.equal(position_ids[0], torch.arange(3 + T))
+
+        emb = m.aura.get_embed_layer()
+        tok = lambda i: emb(torch.tensor([i])).squeeze(0)  # noqa: E731
+        assert torch.allclose(embeds[0, 0], tok(m.aura.bos_id))
+        assert torch.allclose(embeds[0, 1], tok(LANG_MAP["swahili"]))
+        assert torch.allclose(embeds[0, 2], tok(m.aura.speech_start_id))
+        frames = m.codec_emb.frame_embedding(codes[0])
+        assert torch.allclose(embeds[0, 3:], frames, atol=1e-6)
+
+    def test_continuation_forward_supervises_eos_without_text_or_speaker(self):
+        m = _make_tts(seed=5).train()
+        lens = [4, 2]
+        T_max = max(lens)
+        codes = torch.randint(0, CARD, (len(lens), T_max, K))
+        seen = {}
+        orig = m.depth.forward
+
+        def spy(h_t, codes_BK):
+            seen["N"] = h_t.size(0)
+            seen["eos_rows"] = int((codes_BK == m.eos_id).all(dim=1).sum())
+            return orig(h_t, codes_BK)
+
+        m.depth.forward = spy
+        out = m(codes, torch.tensor(lens), ["swahili", "swahili"],
+                conditioning=False)
+        m.depth.forward = orig
+
+        assert torch.isfinite(out["loss"])
+        # Same EOS-extended supervision as TTS: real frames + one EOS per utt.
+        assert seen["N"] == sum(lens) + len(lens)
+        assert seen["eos_rows"] == len(lens)
+        out["loss"].backward()
+        assert m.depth.heads[0].weight.grad is not None
 
 
 class TestTTSForwardLoss:
@@ -282,7 +333,8 @@ class TestTTSForwardLoss:
         # Force EOS in codebook 0 on the 4th frame; the first three are real.
         calls = {"n": 0}
 
-        def fake_frame(h_t, greedy=True, temperature=1.0, eos_id=None):
+        def fake_frame(h_t, greedy=True, temperature=1.0,
+                       top_k=None, top_p=None, eos_id=None):
             calls["n"] += 1
             f = torch.zeros(h_t.size(0), K, dtype=torch.long)
             if calls["n"] == 4:

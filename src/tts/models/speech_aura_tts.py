@@ -160,16 +160,25 @@ class SpeechAuraTTS(nn.Module):
         self,
         codes: torch.Tensor,            # (B, T_max, K) long, padded
         code_lengths: torch.Tensor,    # (B,) true frame counts T_i
-        speaker_vecs: torch.Tensor,    # (B, speaker_dim) float
-        text_ids: torch.Tensor,        # (B, L_max) long, padded
-        text_lengths: torch.Tensor,    # (B,) true text lengths L_i
         languages: list[str],
         device: torch.device,
+        speaker_vecs: torch.Tensor | None = None,   # (B, speaker_dim) float
+        text_ids: torch.Tensor | None = None,       # (B, L_max) long, padded
+        text_lengths: torch.Tensor | None = None,  # (B,) true text lengths L_i
+        conditioning: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build (inputs_embeds, position_ids, prompt_lens) for teacher forcing.
 
-        Per sample the temporal sequence is
-            [BOS, SPK, synth, LANG, text×L, SPEECH_START, frame×T]
+        With conditioning (Stage 1 — TTS), the temporal sequence per sample is
+            [BOS, SPK, synth, LANG, text×L, SPEECH_START, frame×T]   prompt_len = 5 + L
+        Without conditioning (Stage 0 — speech continuation), the prefix drops
+        the speaker token, the synth task marker, and the text, leaving an
+        unconditional acoustic stream
+            [BOS, LANG, SPEECH_START, frame×T]                       prompt_len = 3
+        so the model learns next-frame dynamics decoupled from text/speaker.
+        LANG is kept (cheap per-language prior). speaker_vecs / text_ids /
+        text_lengths are unused when conditioning is False.
+
         Frame embeddings are summed codebook embeddings projected to Aura dim.
         Sequences are right-padded with the BOS embedding (padding is causal-safe
         — it sits past every supervised position and is gathered out by the
@@ -178,7 +187,8 @@ class SpeechAuraTTS(nn.Module):
         embed_layer = self.aura.get_embed_layer()
         B = codes.size(0)
 
-        spk_tokens = self.spk_proj(speaker_vecs.to(device))   # (B, D)
+        spk_tokens = (
+            self.spk_proj(speaker_vecs.to(device)) if conditioning else None)   # (B, D)
 
         seqs: list[torch.Tensor] = []
         prompt_lens: list[int] = []
@@ -191,27 +201,36 @@ class SpeechAuraTTS(nn.Module):
             torch.tensor([self.aura.bos_id], dtype=torch.long, device=device))
 
         for i in range(B):
-            L = int(text_lengths[i].item())
             T = int(code_lengths[i].item())
 
             lang_id = LANG_MAP.get(languages[i], LANG_MAP["eng"])
             lang_emb = embed_layer(
                 torch.tensor([lang_id], dtype=torch.long, device=device))
-            text_emb = embed_layer(text_ids[i, :L].to(device))      # (L, D)
             frame_emb = self.codec_emb.frame_embedding(
                 codes[i, :T].to(device))                            # (T, D)
 
-            seq = torch.cat([
-                bos_emb,
-                spk_tokens[i].unsqueeze(0),
-                synth_emb,
-                lang_emb,
-                text_emb,
-                speech_emb,
-                frame_emb,
-            ], dim=0)
+            if conditioning:
+                L = int(text_lengths[i].item())
+                text_emb = embed_layer(text_ids[i, :L].to(device))  # (L, D)
+                seq = torch.cat([
+                    bos_emb,
+                    spk_tokens[i].unsqueeze(0),
+                    synth_emb,
+                    lang_emb,
+                    text_emb,
+                    speech_emb,
+                    frame_emb,
+                ], dim=0)
+                prompt_lens.append(5 + L)   # BOS,SPK,synth,LANG,text×L,SPEECH_START
+            else:
+                seq = torch.cat([
+                    bos_emb,
+                    lang_emb,
+                    speech_emb,
+                    frame_emb,
+                ], dim=0)
+                prompt_lens.append(3)       # BOS, LANG, SPEECH_START
             seqs.append(seq)
-            prompt_lens.append(5 + L)   # BOS,SPK,synth,LANG,text×L,SPEECH_START
 
         S_max = max(s.size(0) for s in seqs)
         pad_emb = bos_emb.squeeze(0)
@@ -240,19 +259,29 @@ class SpeechAuraTTS(nn.Module):
         self,
         codes: torch.Tensor,
         code_lengths: torch.Tensor,
-        speaker_vecs: torch.Tensor,
-        text_ids: torch.Tensor,
-        text_lengths: torch.Tensor,
         languages: list[str],
+        speaker_vecs: torch.Tensor | None = None,
+        text_ids: torch.Tensor | None = None,
+        text_lengths: torch.Tensor | None = None,
+        conditioning: bool = True,
         **_unused,
     ) -> dict[str, torch.Tensor]:
-        device = text_ids.device
+        """Teacher-forced depth-CE loss.
+
+        conditioning=True  → Stage-1 TTS (text + speaker prefix).
+        conditioning=False → Stage-0 speech continuation (unconditional acoustic
+        stream); speaker_vecs / text_ids / text_lengths are ignored. The EOS
+        frame, gather indexing, and depth CE are identical in both stages — only
+        the prefix length (prompt_lens) differs.
+        """
+        device = codes.device
         B, T_max, K = codes.shape
         assert K == self.K, f"codes has K={K}, model expects {self.K}"
 
         inputs_embeds, position_ids, prompt_lens = self._build_inputs(
-            codes, code_lengths, speaker_vecs, text_ids, text_lengths,
-            languages, device,
+            codes, code_lengths, languages, device,
+            speaker_vecs=speaker_vecs, text_ids=text_ids,
+            text_lengths=text_lengths, conditioning=conditioning,
         )
 
         h = self.aura.forward_hidden(inputs_embeds, position_ids)   # (B, S_max, D)

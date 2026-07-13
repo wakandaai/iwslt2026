@@ -83,3 +83,56 @@ class TTSCollator:
             "languages":    [batch[i]["language"] for i in keep],
             "audio_id":     [batch[i]["audio_id"] for i in keep],
         }
+
+
+@dataclass
+class ContinuationCollator:
+    """Collator for Stage-0 speech continuation (unconditional next-frame).
+
+    Strips text and speaker — emits only the padded (T, K) DAC grids and the
+    language, the inputs SpeechAuraTTS.forward(conditioning=False) needs. The
+    same TTSDataset (and its index CSV) feeds this; text/speaker fields in each
+    example are simply ignored.
+
+    Overflow handling mirrors TTSCollator: utterances longer than max_frames are
+    DROPPED, not cropped. A whole utterance keeps its true end, so the synthetic
+    EOS frame appended in forward() always marks a real stop — cropping a window
+    out of the middle would teach the depth transformer to halt mid-utterance.
+    If long files dominate the data, raise the Aura context (max_seq_len) instead
+    of cropping. Returns None if nothing in the batch survives the guard.
+
+    Args:
+        max_frames: Drop samples with more DAC frames than this. None = no cap
+                    (the DurationBucketSampler is the primary length control).
+    """
+
+    max_frames: int | None = None
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any] | None:
+        keep = [
+            i for i, b in enumerate(batch)
+            if self.max_frames is None or b["frame_count"] <= self.max_frames
+        ]
+        if not keep:
+            return None
+
+        K = batch[keep[0]]["codes"].size(1)
+
+        code_lengths = torch.tensor(
+            [batch[i]["frame_count"] for i in keep], dtype=torch.long)
+        T_max = int(code_lengths.max().item())
+        codes = torch.zeros(len(keep), T_max, K, dtype=torch.long)
+        for j, i in enumerate(keep):
+            c = batch[i]["codes"]
+            codes[j, : c.size(0)] = c
+
+        return {
+            "codes":        codes,
+            "code_lengths": code_lengths,
+            "languages":    [batch[i]["language"] for i in keep],
+            "audio_id":     [batch[i]["audio_id"] for i in keep],
+            # The batch dict is SpeechAuraTTS.forward()'s kwargs by contract, so
+            # the stage selector rides along here: model(**batch) → the
+            # unconditional [BOS, LANG, SPEECH_START, frame×T] prefix.
+            "conditioning": False,
+        }

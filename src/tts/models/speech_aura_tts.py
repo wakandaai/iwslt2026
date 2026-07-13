@@ -112,6 +112,14 @@ class SpeechAuraTTS(nn.Module):
         else:
             self.aura.unfreeze()
 
+        # TTS reads the backbone through forward_hidden() and decodes with the
+        # depth transformer, so lm_head is never on the graph. unfreeze() would
+        # still mark it trainable — leaving one parameter that never receives a
+        # gradient, which makes DDP wait forever for a reduction that never comes
+        # ("Expected to have finished reduction in the prior iteration"). Freezing
+        # it also keeps 82M params out of the optimizer state.
+        self.aura.model.lm_head.requires_grad_(False)
+
         D = aura.hidden_size
 
         # Codec embeddings (shared by the temporal frame input and the depth

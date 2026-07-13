@@ -498,7 +498,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         try:
             import wandb
             wandb.init(
-                project=cfg["wandb"].get("project", "iwslt2026"),
+                project=cfg["wandb"].get("project", "speech_aura"),
                 name=cfg["wandb"].get("name", "pretrain-ctc"),
                 config=cfg,
                 resume="allow" if start_step > 0 else None,

@@ -26,7 +26,7 @@ Examples:
     speech-aura-mic --list-devices
     speech-aura-mic encoder --checkpoint encoder.pt --input-device 3
 
-Requires the optional `mic` extra:  pip install "iwslt2026[mic]"
+Requires the optional `mic` extra:  pip install "speechaura[mic]"
 (sounddevice also needs the system PortAudio library, e.g. `apt install
 libportaudio2` or `brew install portaudio`.)
 """
@@ -59,7 +59,7 @@ def _import_sounddevice():
         print(
             "[error] could not load sounddevice. Install the mic extra and "
             "PortAudio:\n"
-            '  pip install "iwslt2026[mic]"\n'
+            '  pip install "speechaura[mic]"\n'
             "  # then the system lib, e.g.\n"
             "  sudo apt install libportaudio2   # Debian/Ubuntu\n"
             "  brew install portaudio           # macOS\n"

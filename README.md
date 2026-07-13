@@ -1,6 +1,6 @@
-# IWSLT 2026 — End-to-End Speech Translation (Aura-1B)
+# SpeechAura — End-to-End Speech Translation & TTS (Aura-1B)
 
-End-to-end speech translation for the IWSLT 2026 low-resource track,
+End-to-end speech translation and text-to-speech built on the Aura-1B backend,
 targeting African languages (Bemba, Hausa, Igbo, Yoruba → English).
 
 ## Architecture
@@ -83,7 +83,7 @@ pytest tests/ -v
 ## Project Structure
 
 ```
-iwslt2026/
+speechaura/
 ├── configs/
 │   ├── encoder/              # Conformer architecture configs
 │   └── experiment/           # Full experiment configs (one per stage)

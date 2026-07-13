@@ -16,7 +16,7 @@ from core.llama3 import ModelArgs
 # ----------------------------------------------------------------------------
 
 ARCH_PRESETS: dict[str, dict[str, dict]] = {
-    "llama-iwslt": {
+    "llama-aura": {
         "124m": dict(n_layers=12, n_heads=12, dim=768,  intermediate_size=4 * 768,  n_kv_heads=12),
         "500m": dict(n_layers=32, n_heads=16, dim=1024, intermediate_size=3072,     n_kv_heads=4),
         "978m": dict(n_layers=36, n_heads=20, dim=1280, intermediate_size=5120,     n_kv_heads=4),

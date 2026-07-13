@@ -184,7 +184,7 @@ class AuraLLM(nn.Module):
             vocab_size = self.tokenizer.vocab_size
 
         cfg = build_model_config(
-            model_type="llama-iwslt", size=size,
+            model_type="llama-aura", size=size,
             vocab_size=vocab_size, max_seq_len=max_seq_len,
         )
         self.model = LlamaTransformer(cfg)

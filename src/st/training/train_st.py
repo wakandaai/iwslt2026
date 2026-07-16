@@ -55,10 +55,11 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
-from st.data import SpeechDataset, AuraCollator
+from st.data import SpeechDataset, AuraCollator, NllbCollator
 from core.sampler import DurationBucketSampler
 from st.models import (
     SpeechAura, AuraLLM,
+    SpeechNLLB, NLLBSeq2Seq,
     load_encoder_from_checkpoint,
     build_ctc_compressor,
 )
@@ -75,12 +76,20 @@ log = logging.getLogger(__name__)
 # Build model from config
 # ============================================================================
 
-def build_model(cfg: dict) -> SpeechAura:
+def build_model(cfg: dict):
+    """Build SpeechAura (config has an `aura:` block) or SpeechNLLB (`nllb:` block).
+
+    Both honour the same three-method contract the training loop uses —
+    model(**batch) → {"loss", ...}, model.generate(...), model.split_cot_output(...) —
+    so everything downstream (DDP, bucketing, grad accum, eval) is shared.
+    """
     enc_cfg      = cfg["encoder"]
-    aura_cfg     = cfg["aura"]
     proj_cfg     = cfg.get("projector", {"type": "mlp"})
     ctc_comp_cfg = cfg.get("ctc_compress", None)
     train_cfg    = cfg["training"]
+
+    if ("aura" in cfg) == ("nllb" in cfg):
+        raise ValueError("config must have exactly one of an `aura:` or `nllb:` block")
 
     # Encoder
     encoder = load_encoder_from_checkpoint(
@@ -89,6 +98,11 @@ def build_model(cfg: dict) -> SpeechAura:
         vocab_size=enc_cfg.get("vocab_size"),
         strict=False,
     )
+
+    if "nllb" in cfg:
+        return _build_speech_nllb(cfg, encoder, proj_cfg, ctc_comp_cfg, train_cfg)
+
+    aura_cfg = cfg["aura"]
 
     # Aura LLM
     freeze_llm = not train_cfg.get("unfreeze_llm", False)
@@ -135,6 +149,41 @@ def build_model(cfg: dict) -> SpeechAura:
         if unexpected:
             log.warning(f"Projector checkpoint unexpected keys: {unexpected}")
         log.info(f"Projector loaded ← {proj_path}")
+    else:
+        log.info("Projector: no checkpoint specified, training from scratch")
+
+    return model
+
+
+def _build_speech_nllb(cfg, encoder, proj_cfg, ctc_comp_cfg, train_cfg) -> SpeechNLLB:
+    """SpeechNLLB: encoder → (CTC compressor) → projector → NLLB-200."""
+    nllb_cfg = cfg["nllb"]
+
+    nllb = NLLBSeq2Seq(
+        model_path=nllb_cfg["model"],
+        trainable=nllb_cfg.get("trainable", "none"),
+        gradient_checkpointing=train_cfg.get("gradient_checkpointing", False),
+    )
+
+    model = SpeechNLLB(
+        encoder=encoder,
+        nllb=nllb,
+        projector_cfg=proj_cfg,
+        ctc_compress_cfg=ctc_comp_cfg,
+        ctc_weight=train_cfg.get("ctc_weight", 0.0),
+        align_weight=train_cfg.get("align_weight", 0.0),
+        attach=nllb_cfg.get("attach", "encoder_input"),
+        freeze_encoder=not train_cfg.get("unfreeze_encoder", False),
+    )
+
+    # Warm-start from a previous stage. load_checkpoint restores the projector *and*
+    # nllb_trainable.pt if the directory has one — loading only projector.pt would
+    # silently discard e.g. stage 3's trained cross-attention. It loads with
+    # strict=False, so a cross-attn-only state dict is fine for a decoder-trainable
+    # model: the extra params keep their pretrained values.
+    init_ckpt = train_cfg.get("init_from") or train_cfg.get("projector_checkpoint")
+    if init_ckpt:
+        model.load_checkpoint(init_ckpt)
     else:
         log.info("Projector: no checkpoint specified, training from scratch")
 
@@ -597,7 +646,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
     # raw_model is used for: save/load checkpoint, generate, evaluate
     # — these must bypass the DDP wrapper
-    raw_model: SpeechAura = model.module if is_ddp else model
+    raw_model: SpeechAura | SpeechNLLB = model.module if is_ddp else model
 
     # ---- Data ----
     lowercase     = data_cfg.get("lowercase", False)
@@ -632,11 +681,19 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         if master:
             log.info(f"CTC vocab loaded: {len(vocab)} tokens")
 
-    collator = AuraCollator(
-        tokenizer=raw_model.aura.tokenizer,
-        vocab=vocab,
-        max_target_tokens=train_cfg.get("max_target_tokens", 256),
-    )
+    if isinstance(raw_model, SpeechNLLB):
+        collator = NllbCollator(
+            tokenizer=raw_model.nllb.tokenizer,
+            vocab=vocab,
+            max_target_tokens=train_cfg.get("max_target_tokens", 256),
+            need_transcript=train_cfg.get("align_weight", 0.0) > 0,
+        )
+    else:
+        collator = AuraCollator(
+            tokenizer=raw_model.aura.tokenizer,
+            vocab=vocab,
+            max_target_tokens=train_cfg.get("max_target_tokens", 256),
+        )
 
     # Synchronized bucket sampler: shared seed for bucket ORDER (all ranks),
     # per-rank slice for data parallelism
@@ -700,11 +757,51 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             )
 
     # ---- Optimizer ----
-    trainable = [p for p in model.parameters() if p.requires_grad]
     lr     = float(train_cfg.get("lr", 2e-4))
     min_lr = float(train_cfg.get("min_lr", 1e-6))
+
+    # pretrained_lr (optional): a separate, lower LR for the pretrained backbones
+    # (NLLB / speech encoder) while the from-scratch projector keeps the main LR.
+    # Unfreezing a pretrained decoder at the projector's LR is how you erase what it
+    # already knows.
+    trainable = [p for p in model.parameters() if p.requires_grad]
+
+    pretrained_lr = train_cfg.get("pretrained_lr")
+    if pretrained_lr is not None:
+        # Match on the top-level module, tolerating DDP's "module." prefix — a
+        # substring test like ".nllb." silently matches nothing when the model is
+        # unwrapped (params are named "nllb.model...", with no leading dot).
+        BACKBONES = {"nllb", "aura", "encoder"}
+        fresh, pretrained = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            root = name.split(".")[0]
+            if root == "module":
+                root = name.split(".")[1]
+            (pretrained if root in BACKBONES else fresh).append(p)
+
+        if not pretrained:
+            raise ValueError(
+                "pretrained_lr is set but no backbone params require grad — "
+                "either drop pretrained_lr or unfreeze something (nllb.trainable / "
+                "unfreeze_encoder)."
+            )
+        param_groups = [
+            {"params": fresh,      "lr": lr},
+            {"params": pretrained, "lr": float(pretrained_lr)},
+        ]
+        if master:
+            log.info(
+                f"Optimizer: {sum(p.numel() for p in fresh):,} fresh params @ lr={lr:.1e}, "
+                f"{sum(p.numel() for p in pretrained):,} backbone params "
+                f"@ lr={float(pretrained_lr):.1e}"
+            )
+    else:
+        param_groups = trainable
+
     optimizer = torch.optim.AdamW(
-        trainable,
+        param_groups,
         lr=lr,
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
@@ -867,9 +964,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             with sync_ctx:
                 loss.backward()
 
-            # Accumulate unscaled metrics
-            for k in ("loss", "ce_loss", "ctc_loss"):
-                running[k] += out[k].item()
+            # Accumulate unscaled metrics. align_loss is SpeechNLLB-only, so key on
+            # what the model actually returned rather than a fixed list.
+            for k in ("loss", "ce_loss", "ctc_loss", "align_loss"):
+                if k in out:
+                    running[k] = running.get(k, 0.0) + out[k].item()
             run_n            += 1
             micro_step       += 1
             batches_in_epoch += 1

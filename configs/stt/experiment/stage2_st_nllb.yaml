@@ -1,0 +1,110 @@
+# Phase 1 / Stage 2 (NLLB): projector alignment only.
+#
+# encoder → CTC compressor → projector → NLLB-200 (frozen).
+# NLLB stays frozen; only the projector learns, so its whole job is to land audio
+# in the space NLLB's text encoder already understands. The alignment loss pulls
+# it there directly (ZeroSwot-style); CE alone is a much weaker signal.
+#
+# Beats-this baseline (dev, mean over 21 directions): cascade 12.66 BLEU,
+# gold-transcript topline 22.14 — see runs/cascade/RESULTS.md.
+
+encoder:
+  input_dim: 80
+  encoder_dim: 1024
+  num_heads: 16
+  ffn_dim: 4096
+  num_layers: 18
+  depthwise_conv_kernel_size: 31
+  dropout: 0.1
+  checkpoint: runs/stage1_20_lang/encoder_step72000.pt
+  vocab_size: 828
+
+nllb:
+  model: /ocean/projects/cis250145p/shared/checkpoints/nllb-200-distilled-600M
+  # encoder_input : audio → NLLB's text encoder → decoder. Works with far less data.
+  # encoder_outputs: audio → decoder cross-attention directly (SeamlessM4T recipe).
+  attach: encoder_input
+  # none | cross_attn | decoder | all
+  trainable: none
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg
+  # Blank removal makes the audio length approximate the subword length, which is
+  # what lets the projector output line up with NLLB's text-encoder space at all.
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/datasets/AST_INDEX.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/AST_INDEX.csv
+  train_split: train
+  val_split:   dev
+  languages:
+    - amharic
+    - arabic
+    - bemba
+    - english
+    - french
+    - hausa
+    - igbo
+    - kinyarwanda
+    - lingala
+    - luganda
+    - malagasy
+    - portuguese
+    - shona
+    - sotho
+    - swahili
+    - tigrinya
+    - tswana
+    - xhosa
+    - yoruba
+    - zulu
+  max_duration: 30.0
+  lowercase: false   # NLLB is cased — lowercasing would fight its tokenizer
+  vocab_path: /ocean/projects/cis250145p/shared/checkpoints/conformer_encoder/vocab.json
+
+training:
+  task: st
+  output_dir: runs/stage2_nllb_st
+  val_samples_per_lang: 25
+
+  unfreeze_encoder: false
+  ctc_weight: 0.0
+  # ZeroSwot-style pull toward NLLB's text-encoder output space. With NLLB frozen
+  # this is the main thing teaching the projector where to land.
+  align_weight: 1.0
+
+  max_steps: 6000
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+  first_cycle_steps: 35430
+  gamma: 0.8
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 1
+
+  # The 256k-vocab softmax dominates activation memory, but the first run peaked at
+  # only ~6GB of 80GB and sat at 56% GPU util — it was input-starved, not memory- or
+  # compute-bound. Bigger batches + more loader workers (audio is decoded and
+  # resampled 48k->16k on the fly, which is what starves it).
+  max_batch_duration: 300.0
+  max_batch_size: 96
+  max_target_tokens: 256
+  num_workers: 10
+
+  log_every: 50
+  save_every: 2000
+  eval_every: 2000
+
+  no_wandb: false
+  wandb_project: speech_aura
+  wandb_run_name: nllb-projector-st

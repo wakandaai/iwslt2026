@@ -1,15 +1,14 @@
 """
-Collator for SpeechAura training.
+Collators for speech translation training.
 
-Intentionally simple — the collator does NOT know about the encoder,
-compressor, or LLM token format. It just:
-  1. Pads mel features
-  2. Tokenizes target text → target_ids
-  3. Optionally encodes CTC labels
+AuraCollator (SpeechAura, decoder-only): pads mels, tokenizes transcript and
+translation into raw id tensors, and leaves all sequence assembly to
+SpeechAura.forward(), which needs post-compression audio lengths to place the
+audio embeddings.
 
-Sequence assembly (input_ids, labels, audio placeholders) happens inside
-SpeechAura.forward() after encoding, when actual post-compression lengths
-are known.
+NllbCollator (SpeechNLLB, encoder-decoder): pads mels and builds NLLB's own
+seq2seq `labels`. NLLB assembles the decoder sequence itself, so there is no
+prompt to lay out here.
 """
 
 from __future__ import annotations
@@ -125,6 +124,125 @@ class AuraCollator:
                 if lab.size(0) > 0:
                     ctc_pad[j, : lab.size(0)] = lab
 
+            out["ctc_labels"]        = ctc_pad
+            out["ctc_label_lengths"] = torch.tensor(ctc_lengths, dtype=torch.long)
+
+        return out
+
+
+@dataclass
+class NllbCollator:
+    """Collator for SpeechNLLB batches.
+
+    Produces NLLB's native seq2seq targets. tokenizer(text_target=...) already emits
+        labels = [TGT_LANG] t_1 ... t_L </s>
+    and HF shifts that right off decoder_start_token_id (</s>) to build the decoder
+    input — so the language token must NOT be prepended a second time here. Padding
+    becomes -100 so it is ignored by the CE loss.
+
+    transcript_input_ids (source-language encoding of the transcript) is only needed
+    when the alignment loss is on; pass need_transcript=False to skip it.
+
+    Args:
+        tokenizer:         NllbTokenizerFast.
+        vocab:             Optional char->id CTC vocab (adds ctc_labels).
+        max_target_tokens: Drop samples whose target exceeds this token count.
+        need_transcript:   Emit transcript_input_ids for the alignment loss.
+    """
+
+    tokenizer:         Any
+    vocab:             dict[str, int] | None = None
+    max_target_tokens: int = 256
+    need_transcript:   bool = False
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any] | None:
+        from st.data.nllb_lang import to_flores
+
+        pad_id = self.tokenizer.pad_token_id
+
+        keep:        list[int] = []
+        label_list:  list[torch.Tensor] = []
+        src_ids_list: list[torch.Tensor] = []
+
+        for i, b in enumerate(batch):
+            target = b["translation"] if b["task"] in ("cot", "st") else b["transcript"]
+            if not target:
+                continue
+
+            # Per-sample: a batch can mix translation directions, and src_lang/tgt_lang
+            # are tokenizer *state*, not call arguments.
+            self.tokenizer.src_lang = to_flores(b["src_language"])
+            self.tokenizer.tgt_lang = to_flores(b["tgt_language"])
+
+            lab = self.tokenizer(text_target=target, add_special_tokens=True)["input_ids"]
+            if len(lab) > self.max_target_tokens:
+                log.debug(
+                    f"Dropping {b.get('audio_id', i)}: target {len(lab)} tokens "
+                    f"> max_target_tokens"
+                )
+                continue
+
+            label_list.append(torch.tensor(lab, dtype=torch.long))
+            if self.need_transcript:
+                src_ids_list.append(torch.tensor(
+                    self.tokenizer(b["transcript"], add_special_tokens=True)["input_ids"],
+                    dtype=torch.long,
+                ))
+            keep.append(i)
+
+        if not keep:
+            return None
+
+        # Mels
+        mel_lens = torch.tensor([batch[i]["mel_len"] for i in keep], dtype=torch.long)
+        max_mel  = int(mel_lens.max().item())
+        mel_pad  = torch.zeros(len(keep), max_mel, 80)
+        for j, i in enumerate(keep):
+            mel_pad[j, : batch[i]["mel_len"]] = batch[i]["mel"]
+
+        # Labels — pad with -100 so CE ignores them
+        max_l  = max(t.size(0) for t in label_list)
+        labels = torch.full((len(keep), max_l), -100, dtype=torch.long)
+        for j, t in enumerate(label_list):
+            labels[j, : t.size(0)] = t
+
+        out: dict[str, Any] = {
+            "audio_features": mel_pad,
+            "audio_lengths":  mel_lens,
+            "labels":         labels,
+            "src_language":   [batch[i]["src_language"] for i in keep],
+            "tgt_language":   [batch[i]["tgt_language"] for i in keep],
+            "task":           [batch[i]["task"]         for i in keep],
+        }
+
+        if self.need_transcript:
+            max_s = max(t.size(0) for t in src_ids_list)
+            src_ids  = torch.full((len(keep), max_s), pad_id, dtype=torch.long)
+            src_mask = torch.zeros(len(keep), max_s, dtype=torch.long)
+            for j, t in enumerate(src_ids_list):
+                src_ids[j, : t.size(0)]  = t
+                src_mask[j, : t.size(0)] = 1
+            out["transcript_input_ids"]      = src_ids
+            out["transcript_attention_mask"] = src_mask
+
+        # Optional CTC labels — always from the SOURCE transcript
+        if self.vocab is not None:
+            ctc_list:    list[torch.Tensor] = []
+            ctc_lengths: list[int]          = []
+            for i in keep:
+                encoded = [
+                    self.vocab[c] if c in self.vocab else self.vocab[" "]
+                    for c in batch[i]["transcript"]
+                    if c in self.vocab or " " in self.vocab
+                ]
+                ctc_list.append(torch.tensor(encoded, dtype=torch.long))
+                ctc_lengths.append(len(encoded))
+
+            max_ctc = max(max((len(t) for t in ctc_list), default=1), 1)
+            ctc_pad = torch.zeros(len(keep), max_ctc, dtype=torch.long)
+            for j, lab in enumerate(ctc_list):
+                if lab.size(0) > 0:
+                    ctc_pad[j, : lab.size(0)] = lab
             out["ctc_labels"]        = ctc_pad
             out["ctc_label_lengths"] = torch.tensor(ctc_lengths, dtype=torch.long)
 

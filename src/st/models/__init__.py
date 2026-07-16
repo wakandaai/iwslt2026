@@ -6,6 +6,8 @@ from core.aura import (
     AUDIO_PLACEHOLDER_ID, TRANSCRIPT_START_ID,
     TASK_ASR_ID, TASK_COT_ID, TRANSLATE_START_ID)
 from st.models.speech_aura import SpeechAura
+from st.models.nllb import NLLBSeq2Seq
+from st.models.speech_nllb import SpeechNLLB
 
 __all__ = [
     "SpeechEncoder",
@@ -23,4 +25,6 @@ __all__ = [
     "TASK_COT_ID",
     "TRANSLATE_START_ID",
     "SpeechAura",
+    "NLLBSeq2Seq",
+    "SpeechNLLB",
 ]

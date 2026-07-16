@@ -43,11 +43,19 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
 
         self.first_cycle_steps = first_cycle_steps
         self.cycle_mult        = cycle_mult
-        self.base_max_lr       = max_lr
-        self.max_lr            = max_lr
         self.min_lr            = min_lr
         self.warmup_steps      = warmup_steps
         self.gamma             = gamma
+
+        # Peak LR is PER param group: each group's configured lr is its own peak.
+        # A single shared max_lr would silently drag a low-LR group (e.g. a pretrained
+        # backbone deliberately set to 2e-5) up to the projector's LR and wipe out the
+        # pretrained weights. With one param group this is identical to the old
+        # behaviour, since build_scheduler passes max_lr=param_groups[0]["lr"].
+        self.base_max_lrs = [
+            float(pg.get("lr", max_lr)) for pg in optimizer.param_groups
+        ]
+        self.max_lrs = list(self.base_max_lrs)
 
         self.cur_cycle_steps = first_cycle_steps
         self.cycle           = 0
@@ -67,18 +75,18 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
             return self.base_lrs
         elif self.step_in_cycle < self.warmup_steps:
             return [
-                (self.max_lr - base_lr) * self.step_in_cycle / self.warmup_steps + base_lr
-                for base_lr in self.base_lrs
+                (max_lr - base_lr) * self.step_in_cycle / self.warmup_steps + base_lr
+                for base_lr, max_lr in zip(self.base_lrs, self.max_lrs)
             ]
         else:
             return [
-                base_lr + (self.max_lr - base_lr)
+                base_lr + (max_lr - base_lr)
                 * (1 + math.cos(
                     math.pi
                     * (self.step_in_cycle - self.warmup_steps)
                     / (self.cur_cycle_steps - self.warmup_steps)
                 )) / 2
-                for base_lr in self.base_lrs
+                for base_lr, max_lr in zip(self.base_lrs, self.max_lrs)
             ]
 
     def step(self, epoch=None):
@@ -113,7 +121,7 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
                 self.cur_cycle_steps = self.first_cycle_steps
                 self.step_in_cycle   = epoch
 
-        self.max_lr    = self.base_max_lr * (self.gamma ** self.cycle)
+        self.max_lrs = [m * (self.gamma ** self.cycle) for m in self.base_max_lrs]
         self.last_epoch = math.floor(epoch)
         for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
             param_group["lr"] = lr

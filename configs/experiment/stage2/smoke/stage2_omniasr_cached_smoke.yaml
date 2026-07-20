@@ -1,0 +1,76 @@
+# Stage 2, cached-features, historical 4-language smoke run. Superseded by
+# ../stage2_omniasr_live_22lang.yaml — see docs/stage1_omniasr_ctc_guide.md.
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg        # only "avg" is supported in cached mode (see CTCCompressor.forward_cached)
+  remove_blanks: true
+  blank_id: 0
+
+cached_features:
+  enabled: true
+  cache_dir: /ocean/projects/cis250145p/tanghang/iwslt2026/cache/omniasr_ctc_1b
+  encoder_output_dim: 1280
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  train_split: train
+  val_split:   dev
+  languages:
+    - igbo
+    - yoruba
+    - hausa
+    - bemba
+  max_duration: 20.0
+  lowercase: true
+
+training:
+  task: transcribe
+  output_dir: runs/stage2_omniasr_cached
+  val_samples_per_lang: 20
+
+  unfreeze_encoder: false   # required — no live encoder to unfreeze in cached mode
+  unfreeze_llm: false
+  lora_rank: 0
+
+  ctc_weight: 0.0           # required — cached mode has no per-frame ctc_logits for aux loss
+
+  max_steps: 500
+  lr: 5.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 50
+  first_cycle_steps: 500
+  gamma: 0.5
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 4
+
+  max_batch_duration: 240.0
+  max_batch_size: 96
+  max_seq_len: 1024
+  num_workers: 4
+
+  log_every: 20
+  save_every: 250
+  eval_every: 250
+
+  no_wandb: false
+  wandb_project: iwslt2026
+  wandb_run_name: stage2_omniasr_cached_validation
+
+wandb:
+  enabled: true
+  project: iwslt2026
+  name: stage2-omniasr-cached-validation

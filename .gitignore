@@ -1,0 +1,15 @@
+*.egg-info/
+*.pyc
+__pycache__/
+*.out
+run*.sh
+wandb/
+checkpoints/
+runs/
+Aura-1B/
+.pytest_cache/
+dist/
+build/
+.envs/
+cache/
+*.err

@@ -1,0 +1,54 @@
+# Stage 1: omniASR_CTC_1B fine-tune, CTC-loss only, all 22 languages.
+# Standalone — no projector/compressor/LLM loaded. Must run under
+# .envs/omniasr_extract (torch==2.8.0+cu128), not Aura_base/env.
+# See docs/stage1_omniasr_ctc_guide.md for batch-setting history.
+
+encoder:
+  type: omniasr_live
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR-CTC-1B.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: false   # this script's only loss target is the CTC head itself
+
+data:
+  train_index:      /ocean/projects/cis250145p/shared/ASR_INDEX_V4_16k.csv
+  val_index:        /ocean/projects/cis250145p/shared/ASR_INDEX_V4_16k.csv
+  train_split:       train
+  val_split:         dev
+  sp_tokenizer_path: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
+  languages:          null   # null = all 22 languages in the index
+  max_duration:       20.0
+  min_duration:       0.5
+  max_target_tokens:  400
+  lowercase:          true
+
+training:
+  output_dir: runs/stage1_omniasr_ctc_22lang
+
+  max_steps: 20000
+  lr: 1.0e-5
+  min_lr: 1.0e-7
+  warmup_steps: 500
+  first_cycle_steps: 20000
+  gamma: 0.5
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 16
+
+  max_batch_duration: 40.0
+  max_batch_size: 4
+  num_workers: 4
+
+  log_every: 20
+  save_every: 5000
+  eval_every: 500
+  val_samples_per_lang: 30
+  val_batch_size: 4
+
+  no_wandb: false
+  wandb_project: aura-mt
+  wandb_entity: etanghan-carnegie-mellon-university
+  wandb_run_name: stage1_omniasr_ctc_22lang

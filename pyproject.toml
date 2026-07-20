@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aura-asr-v1"
+version = "0.1.0"
+description = "Aura-ASR v1: Stage 1 omniASR_CTC_1B fine-tune, standalone from the main IWSLT 2026 / SpeechAura codebases"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+    "transformers>=4.40.0",
+    "datasets>=2.18.0",
+    "soundfile>=0.12.0",
+    "pyyaml>=6.0",
+    "sacrebleu>=2.4.0",
+    "jiwer>=3.0.0",
+    "wandb>=0.16.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

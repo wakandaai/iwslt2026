@@ -1,0 +1,84 @@
+# Stage 4 (live-unfrozen omniASR): encoder unfrozen + CTCCompressor +
+# projector trainable; LLM frozen. Small max_steps/batch — proving the
+# pipeline trains at all before scaling up. Must run under
+# .envs/omniasr_extract, not Aura_base/env. Run smoke_test_omniasr_live.py first.
+# See docs/stage1_omniasr_ctc_guide.md for OOM history.
+
+encoder:
+  type: omniasr_live
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR-CTC-1B.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: true   # gets no gradient anyway; avoids pointless weight decay
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg        # only strategy that needs no gradient through ctc_logits
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  val_index:   /ocean/projects/cis250145p/shared/datasets/ASR_INDEX.csv
+  train_split: train
+  val_split:   dev
+  languages:
+    - igbo
+    - yoruba
+    - hausa
+    - bemba
+  max_duration: 20.0
+  lowercase: true
+
+training:
+  task: transcribe
+  output_dir: runs/stage4_omniasr_live
+  val_samples_per_lang: 20
+
+  unfreeze_encoder: true
+  unfreeze_llm: false
+  lora_rank: 0
+
+  ctc_weight: 0.0       # required — enforced by build_model()'s omniasr_live guard
+
+  max_steps: 500
+  lr: 1.0e-5            # low — a 975M-param pretrained encoder is easy to destroy
+  min_lr: 1.0e-7
+  warmup_steps: 50
+  first_cycle_steps: 500
+  gamma: 0.5
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 64
+
+  max_batch_duration: 10.0   # cut from 40.0 after a real OOM — see guide.md
+  max_batch_size: 2
+  max_seq_len: 1024
+  num_workers: 4
+
+  log_every: 10
+  save_every: 100
+  eval_every: 100
+
+  no_wandb: false
+  wandb_project: iwslt2026
+  wandb_run_name: stage4_omniasr_live_smoke
+
+wandb:
+  enabled: true
+  project: iwslt2026
+  name: stage4-omniasr-live-smoke

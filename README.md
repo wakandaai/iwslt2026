@@ -31,7 +31,7 @@ Raw 16kHz audio → omniASR_CTC_1B
 
 | Stage | What trains | Config | Status |
 |---|---|---|---|
-| 1 — CTC Pretraining | omniASR_CTC_1B encoder | `configs/experiment/stage1/`, `stage1_omniasr_ctc_h100_weighted.yaml` | **done — val/wer=0.3265** |
+| 1 — CTC Pretraining | omniASR_CTC_1B encoder | `configs/experiment/stage1/stage1_v1.yaml` | **done — val/wer=0.3265** |
 | 2 — Projector Alignment | Projector only, frozen encoder (live) | `configs/experiment/stage2/` | built, **not yet validated** |
 | 3 — LoRA Fine-tuning | Projector + LoRA, frozen encoder | `configs/experiment/stage3/` | built, **not yet validated** |
 | 4 — Full Fine-tuning | Encoder unfrozen + Projector + LoRA | `configs/experiment/stage4/` | built, **not yet validated** |
@@ -79,7 +79,7 @@ one lives at `/ocean/projects/cis250145p/tanghang/iwslt2026/.envs/omniasr_extrac
 
 # Resume
 <omniasr_extract>/bin/python -m st.training.pretrain_omniasr_ctc \
-    --config configs/experiment/stage1_omniasr_ctc_h100_weighted.yaml \
+    --config configs/experiment/stage1/stage1_v1.yaml \
     --resume_from /path/to/encoder_step3500.pt
 ```
 
@@ -136,14 +136,13 @@ needed), and a sanity check over every shipped Stage 1 config.
 ```
 aura-asr-v1/
 ├── configs/experiment/
-│   ├── stage1/                       # omniASR_CTC_1B configs (production) — validated
+│   ├── stage1/                       # stage1_v1.yaml (validated) + other hardware variants
 │   │   └── smoke/
-│   ├── stage2/                       # projector alignment, frozen encoder (live) — unvalidated
+│   ├── stage2/                       # stage2_v1.yaml — projector alignment, frozen encoder (live) — unvalidated
 │   │   └── smoke/                    # historical 4-language cached-features run
-│   ├── stage3/                       # + LoRA, encoder still frozen — unvalidated
-│   ├── stage4/                       # encoder unfrozen, LoRA continues — unvalidated
-│   │   └── smoke/                    # historical 4-language validation configs
-│   └── stage1_omniasr_ctc_h100_weighted.yaml   # the validated production run
+│   ├── stage3/                       # stage3_v1.yaml — + LoRA, encoder still frozen — unvalidated
+│   └── stage4/                       # stage4_v1.yaml — encoder unfrozen, LoRA continues — unvalidated
+│       └── smoke/                    # historical 4-language validation configs
 │
 ├── docs/
 │   ├── stage1_omniasr_ctc_guide.md  # design doc, run history, per-stage update notes

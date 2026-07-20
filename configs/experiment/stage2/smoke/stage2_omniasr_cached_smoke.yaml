@@ -1,5 +1,5 @@
 # Stage 2, cached-features, historical 4-language smoke run. Superseded by
-# ../stage2_omniasr_live_22lang.yaml — see docs/stage1_omniasr_ctc_guide.md.
+# ../stage2_v1.yaml — see docs/stage1_omniasr_ctc_guide.md.
 
 aura:
   checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt

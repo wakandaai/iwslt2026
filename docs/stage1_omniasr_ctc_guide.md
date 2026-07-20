@@ -496,7 +496,7 @@ loss = 0.9 * ce_loss + 0.1 * ctc_loss
 
 **Expected outcome:** Projector learns to map CTC-compressed encoder representations into Aura-1B's embedding space. Validation: attach frozen encoder + projector to Aura-1B and run greedy decode on FLEURS dev.
 
-**Update (2026-07-20):** Built as `configs/experiment/stage2/stage2_omniasr_live_22lang.yaml`,
+**Update (2026-07-20):** Built as `configs/experiment/stage2/stage2_v1.yaml`,
 pointed at the real Stage 1 checkpoint (`encoder_step20000.pt`, val/wer=0.3265). Two deviations
 from the plan above, both deliberate:
 - **Live, not cached.** The original plan implied precomputing encoder features; caching the full
@@ -561,13 +561,13 @@ lora_config = LoRAConfig(
 
 **Expected outcome:** Full Aura-ASR v2 system. The LLM drives WER well below the CTC standalone, leveraging African text priors in Aura-1B's 64k BPE vocabulary.
 
-**Update (2026-07-20):** Built as `configs/experiment/stage3/stage3_omniasr_live_22lang.yaml` —
+**Update (2026-07-20):** Built as `configs/experiment/stage3/stage3_v1.yaml` —
 `r=32/alpha=64` targeting `q_proj/v_proj` only (not the roadmap's full attention+FFN target list;
 matches the real, working Conformer `stage3.yaml` precedent, not an untested plan), single
 `lr: 5e-5` for both projector and LoRA (`train_st.py` has no per-param-group LR mechanism), and
 `ctc_weight: 0.0` (required by `build_model()`'s `omniasr_live` guard — no auxiliary CTC loss is
 possible against omniASR's SentencePiece vocab). Encoder and batch settings otherwise match
-`stage2_omniasr_live_22lang.yaml`, since the memory profile is the same (encoder frozen either way;
+`stage2_v1.yaml`, since the memory profile is the same (encoder frozen either way;
 LoRA adapters are negligible extra trainable params next to a 2-layer projector). Not runnable yet:
 `projector_checkpoint` needs Stage 2's real output, which doesn't exist until that config actually
 runs. Note: the existing Conformer `stage3.yaml` has a real bug — its header says "Freeze encoder"

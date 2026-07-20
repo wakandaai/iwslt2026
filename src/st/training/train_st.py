@@ -9,8 +9,8 @@ Controlled entirely by the experiment YAML — no code changes needed to
 switch stages.
 
 Usage:
-    python -m st.training.train_st --config configs/experiment/stage2/stage2_omniasr_live_22lang.yaml
-    python -m st.training.train_st --config configs/experiment/stage3/stage3_omniasr_live_22lang.yaml \
+    python -m st.training.train_st --config configs/experiment/stage2/stage2_v1.yaml
+    python -m st.training.train_st --config configs/experiment/stage3/stage3_v1.yaml \
         --resume_from runs/stage2_omniasr_live_22lang/checkpoint_stepNNNN
 """
 

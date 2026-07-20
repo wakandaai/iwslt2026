@@ -97,7 +97,7 @@ expected at:
 
 ### Stage 2: Train projector
 ```bash
-sbatch scripts/stage2_omniasr_live/train_stage2_omniasr_live_22lang.sbatch
+sbatch scripts/stage2_omniasr_live/stage2_v1.sbatch
 ```
 `stage2/smoke/stage2_omniasr_cached_smoke.yaml` is the original 4-language
 cached-features validation run this was based on (kept as historical
@@ -105,14 +105,14 @@ reference for the caching approach that was dropped — see Status above).
 
 ### Stage 3: Train projector + LoRA
 ```bash
-sbatch scripts/stage3_omniasr_live/train_stage3_omniasr_live_22lang.sbatch
+sbatch scripts/stage3_omniasr_live/stage3_v1.sbatch
 ```
 Chains off Stage 2's projector output via `training.projector_checkpoint`
 in the config, which doesn't exist yet.
 
 ### Stage 4: Unfreeze encoder
 ```bash
-sbatch scripts/stage4_omniasr_live/train_stage4_omniasr_live_22lang.sbatch
+sbatch scripts/stage4_omniasr_live/stage4_v1.sbatch
 ```
 Set `RESUME_FROM` at the top of that script to Stage 3's real checkpoint
 directory once it exists (chains the LoRA adapters forward via

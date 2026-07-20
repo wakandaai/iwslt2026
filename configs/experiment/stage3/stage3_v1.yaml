@@ -42,7 +42,7 @@ data:
 training:
   task: transcribe
   output_dir: runs/stage3_omniasr_live_22lang
-  # TODO: set once Stage 2 (stage2_omniasr_live_22lang.yaml) has actually run
+  # TODO: set once Stage 2 (stage2_v1.yaml) has actually run
   # projector_checkpoint: runs/stage2_omniasr_live_22lang/checkpoint_stepNNNN
   val_samples_per_lang: 30
 

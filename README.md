@@ -7,30 +7,11 @@ package, no TTS, no NLLB.
 
 ## Status
 
-**Stage 1 is complete.** Single H100, resumed + `WeightedLanguageSampler` +
-online W&B: finished all 20k steps with zero OOM
-(`max_batch_duration=35s / max_batch_size=6 / grad_accum=4`, ~0.8s/step),
-final `val/wer=0.3265` (English best at 0.062, Yoruba/Tigrinya hardest at
-0.63/0.57). Final checkpoint:
-`runs/stage1_omniasr_ctc_22lang_h100_weighted/encoder_step20000.pt` (in the
-original `iwslt2026` checkout, not copied into this repo).
-
-**Stages 2-4 are built but unvalidated — no run has happened yet.**
-`configs/experiment/stage{2,3,4}/` each hold a v1-scoped (22-language)
-config plus historical smoke-test configs. The chain is: Stage 2 aligns the
-projector (encoder frozen, computed live — not cached, since caching all 22
-languages would need ~4TB against a filesystem with only ~4.4TB free); Stage
-3 adds LoRA on top (encoder still frozen); Stage 4 unfreezes the encoder too
-(LoRA continues via `--resume_from`). Batch settings everywhere are
-reasoned-not-validated guesses. See `docs/stage1_omniasr_ctc_guide.md` for
-the full design rationale and update history per stage.
-
-The Conformer-based training path (`pretrain_ctc.py`, `train_st.py`'s
-default `encoder.type: conformer`) still exists in the code but has no
-config shipped for it anymore — it was removed as no longer useful once the
-omniASR path covered all 4 stages. `st/models/encoder.py` (SpeechEncoder)
-and `st/inference/generate.py` (mel-only, not omniASR-compatible yet) are
-still present but currently unexercised by any shipped config.
+Stage 1 is done (`val/wer=0.3265`, checkpoint
+`runs/stage1_omniasr_ctc_22lang_h100_weighted/encoder_step20000.pt`, not
+copied into this repo). Stages 2-4 are built but unvalidated — no run has
+happened yet. See the stage table below and
+`docs/stage1_omniasr_ctc_guide.md` for full rationale and update history.
 
 ## Architecture
 

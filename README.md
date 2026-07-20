@@ -1,9 +1,9 @@
 # Aura-ASR v1
 
-End-to-end speech translation, targeting African languages (Bemba, Hausa,
-Igbo, Yoruba → English), built on Meta's `omniASR_CTC_1B` encoder + Aura-1B
-LLM. Standalone snapshot — deliberately self-contained: no shared `core/`
-package, no TTS, no NLLB.
+End-to-end speech recognition (transcription) for low-resource African
+languages (Bemba, Hausa, Igbo, Yoruba, ...), built on Meta's
+`omniASR_CTC_1B` encoder + Aura-1B LLM. Standalone snapshot — deliberately
+self-contained: no shared `core/` package, no TTS, no NLLB.
 
 ## Status
 

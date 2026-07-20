@@ -183,11 +183,11 @@ aura-asr-v1/
 │       └── ddp_utils.py             # DDP setup/teardown/reduce/barrier
 │
 ├── scripts/
-│   ├── stage1_omniasr_ctc/          # SLURM launchers (Stage 1) — validated
+│   ├── stage1_omniasr_ctc/          # (Stage 1) — validated
 │   │   └── smoke/
-│   ├── stage2_omniasr_live/         # SLURM launcher (Stage 2) — unvalidated
-│   ├── stage3_omniasr_live/         # SLURM launcher (Stage 3) — unvalidated
-│   ├── stage4_omniasr_live/         # SLURM launcher (Stage 4) — unvalidated
+│   ├── stage2_omniasr_live/         # (Stage 2) — unvalidated
+│   ├── stage3_omniasr_live/         # (Stage 3) — unvalidated
+│   ├── stage4_omniasr_live/         # (Stage 4) — unvalidated
 │   ├── smoke_test_cached.py         # Stage 2 cached-mode smoke test (historical)
 │   ├── smoke_test_omniasr_live.py   # Stage 4 live-encoder smoke test
 │   ├── extract_omniasr_features.py  # offline feature extraction (historical cached-mode tool)

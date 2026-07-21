@@ -337,6 +337,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         min_lr=min_lr,
         warmup_steps=train_cfg.get("warmup_steps", 500),
         first_cycle_steps=train_cfg.get("first_cycle_steps", total_steps),
+        cycle_mult=train_cfg.get("cycle_mult", 1.0),
         gamma=train_cfg.get("gamma", 1.0),
     )
 

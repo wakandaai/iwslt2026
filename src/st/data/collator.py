@@ -15,12 +15,27 @@ are known.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 log = logging.getLogger(__name__)
+
+# The omniASR_CTC_1B SentencePiece vocab has no tokens for these characters —
+# encoding them maps to <unk>, which corrupts both CTC training targets and
+# WER references (decodes back as a literal "⁇" placeholder word). Strip them
+# before CTC tokenization only; "-" and "'" are real vocab pieces and are left
+# alone. Aura-1B's own tokenizer (used elsewhere in this file) has full
+# punctuation support, so this must NOT be applied to its targets.
+_CTC_UNSUPPORTED_PUNCT_RE = re.compile(r"[,.;:!?]")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _strip_ctc_unsupported_punct(text: str) -> str:
+    text = _CTC_UNSUPPORTED_PUNCT_RE.sub(" ", text)
+    return _WHITESPACE_RE.sub(" ", text).strip()
 
 
 def _tokenize_targets(
@@ -272,7 +287,8 @@ class CTCRawAudioCollator:
         label_list: list[torch.Tensor] = []
 
         for i, b in enumerate(batch):
-            ids = self.sp_tokenizer.encode(b["text"], out_type=int)
+            text = _strip_ctc_unsupported_punct(b["text"])
+            ids = self.sp_tokenizer.encode(text, out_type=int)
             if not ids or len(ids) > self.max_target_tokens:
                 continue
             label_list.append(torch.tensor(ids, dtype=torch.long))

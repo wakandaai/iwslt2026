@@ -465,6 +465,41 @@ total_loss = L_ctc_final + 0.3 * L_ctc_intermediate_layer24 + λ(step) * L_lail
 
 **Expected outcome:** A standalone `omniASR_CTC_1B` specialized on 23 African languages that beats or matches Whisper-large-v3 on all FLEURS/NCHLT benchmarks as a CTC-only system. This is the "excellent encoder out of the box" target. Because the CTC head is warm-started, convergence is faster and the model should reach low WER well before 20k steps — checkpoint the model every 500 steps and select by validation WER.
 
+**Update (2026-07-20) — v1 run complete, real problems found, v2 launched:**
+
+v1 (`stage1_omniasr_ctc_h100_weighted.yaml`, 20k steps, single H100) completed with
+`val/wer=0.3265`, but two real issues surfaced on review, both fixed for v2:
+
+- **Punctuation corruption.** The omniASR CTC vocab has zero tokens for `, . ; : ! ?`
+  — encoding any of them maps to `<unk>` (confirmed against the tokenizer directly:
+  `sp.encode(',')` → id 3 → decodes back as literal `" ⁇ "`). FLEURS/Waxal references
+  are 60-99% punctuated, so this was corrupting both the CTC training targets and the
+  WER references for ~18/22 languages. Retroactively stripping `⁇` from the existing
+  val_preds closed part of the gap (overall WER 32.65%→29.98% at step 20000) but is
+  much bigger for punctuation-heavy Bantu-orthography languages (zulu 20.7%→14.4%,
+  afrikaans 32.4%→24.3%) than for languages like Yoruba/Igbo/Bemba, which stayed high
+  — those are genuinely hard, not an artifact. Fix: `_strip_ctc_unsupported_punct()`
+  added to `collator.py`'s `CTCRawAudioCollator.__call__`, applied before
+  `sp_tokenizer.encode()` for both train and dev (must be symmetric — stripping only
+  one side just relocates the corruption). Scoped to the CTC path specifically, not
+  `dataset.py` — Stage 2-4's `AuraCollator`/`RawAudioCollator` tokenize the same raw
+  `text` with Aura-1B's own tokenizer, which has full punctuation support, so stripping
+  it at the dataset level would have needlessly denied Stages 2-4 real punctuation.
+- **Batch settings were far too conservative.** v1's header called them a "reasoned,
+  unvalidated estimate" for the first-ever H100 test. Real W&B system-metrics logs
+  (`gpu.0.memoryAllocated`) show only ~30GB/80GB used, and GPU compute utilization
+  averaged 69.6% (dipping to 0% repeatedly) — almost certainly from `eval_every: 250`
+  triggering 80 synchronous CPU-bound validation+checkpoint stalls over the run.
+
+**v2** (`stage1_v2.yaml`): fresh run, no `--resume_from`, 2x H100-80 DDP (`torchrun
+--standalone --nproc_per_node=2`), `max_batch_duration=65/max_batch_size=10/grad_accum=1`
+(real headroom from the v1 profiling data), `eval_every=1000/save_every=2000` (was
+250/250), `max_steps=50000` with a 2-cycle `cosine_warmup_restarts` schedule
+(`first_cycle_steps=25000, gamma=1.0` — anneals `1e-5`→`1e-7` then back to full `1e-5`
+once more at step 25000, not one long single-cycle decay like v1's `first_cycle_steps=20000`).
+Note: `cycle_mult` was silently dropped by `pretrain_omniasr_ctc.py`'s scheduler call
+before this — added so the config key is actually live.
+
 ---
 
 ### Stage 2: CTC Compressor + Projector Training

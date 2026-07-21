@@ -1,0 +1,65 @@
+
+# Stage 1 v2: fresh run from scratch (no --resume_from), 2x H100-80 DDP.
+# Corrects v1's issues: punctuation-stripping bug fixed in dataset.py,
+# batch settings raised to match real H100 memory headroom (v1 only used
+# ~30GB/80GB), eval/save frequency reduced, 5-cycle LR warm restarts
+# instead of one long single-cycle decay. See docs/stage1_omniasr_ctc_guide.md.
+# Must run under .envs/omniasr_extract/bin/python (torch==2.8.0+cu128) via
+# torchrun --standalone --nproc_per_node=2.
+
+encoder:
+  type: omniasr_live
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR-CTC-1B.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: false
+
+data:
+  train_index:      /ocean/projects/cis250145p/shared/ASR_INDEX_V4_16k.csv
+  val_index:        /ocean/projects/cis250145p/shared/ASR_INDEX_V4_16k.csv
+  train_split:       train
+  val_split:         dev
+  sp_tokenizer_path: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
+  languages:          null   # null = all 22 languages in the index
+  max_duration:       20.0
+  min_duration:       0.5
+  max_target_tokens:  400
+  lowercase:          true
+
+training:
+  output_dir: runs/stage1_v2_ddp2
+
+  max_steps: 50000
+  lr: 1.0e-5
+  min_lr: 1.0e-7
+  warmup_steps: 500
+  first_cycle_steps: 25000
+  cycle_mult: 1.0
+  gamma: 1.0
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 1
+
+  max_batch_duration: 65.0
+  max_batch_size: 10
+  num_workers: 4
+
+  sampling:
+    strategy: weighted_language
+    beta_language: 0.7
+    num_batches: 130000   # max_steps(50000) * grad_accum(1) * world_size(2) = 100,000 + buffer
+    seed: 42
+
+  log_every: 20
+  save_every: 2000
+  eval_every: 1000
+  val_samples_per_lang: 30
+  val_batch_size: 4
+
+  no_wandb: false
+  wandb_project: aura-mt
+  wandb_entity: etanghan-carnegie-mellon-university
+  wandb_run_name: stage1_v2_ddp2

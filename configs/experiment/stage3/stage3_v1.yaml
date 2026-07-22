@@ -72,6 +72,7 @@ training:
   log_every: 20
   save_every: 500
   eval_every: 500
+  val_max_batches: 50   # dev split is 120k+ examples — full pass through the LLM is too slow to run every eval
 
   no_wandb: false
   wandb_project: aura-mt

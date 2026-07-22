@@ -304,7 +304,8 @@ def evaluate(
     val_generate_indices: list[int],
     step: int = 0,
     output_dir: str | None = None,
-    mode: str = "mel") -> dict[str, float]:
+    mode: str = "mel",
+    val_max_batches: int | None = 50) -> dict[str, float]:
     """mode: "mel" (live Conformer) | "cached" (frozen omniASR features) |
     "waveform" (live/unfrozen omniASR encoder)."""
 
@@ -316,7 +317,13 @@ def evaluate(
     model.eval()
     total_loss, n = 0.0, 0
 
+    # val_loader is built from the full dev split (can be 100k+ examples) —
+    # a full-model forward pass here (encoder+compressor+projector+LLM) is far
+    # more expensive per-example than Stage 1's CTC-only loss, so unlike
+    # Stage 1 this must stay bounded regardless of eval_every.
     for batch in val_loader:
+        if val_max_batches is not None and n >= val_max_batches:
+            break
         if batch is None:
             continue
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
@@ -667,6 +674,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     log_every     = train_cfg.get("log_every", 100)
     save_every    = train_cfg.get("save_every", 5000)
     eval_every    = train_cfg.get("eval_every", 5000)
+    val_max_batches = train_cfg.get("val_max_batches", 50)
     oom_cooldown  = 0
 
     running: dict[str, float] = {"loss": 0.0, "ce_loss": 0.0, "ctc_loss": 0.0}
@@ -769,7 +777,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                     model, val_loader, device, task,
                     val_generate_indices=val_generate_indices,
                     step=global_step, output_dir=output_dir,
-                    mode=data_mode,
+                    mode=data_mode, val_max_batches=val_max_batches,
                 )
                 log.info(
                     f"step {global_step} val | "
@@ -790,7 +798,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             model, val_loader, device, task,
             val_generate_indices=val_generate_indices,
             step=global_step, output_dir=output_dir,
-            mode=data_mode,
+            mode=data_mode, val_max_batches=val_max_batches,
         )
         log.info("Final val | " + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
         if use_wandb:

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from st.data import (
@@ -41,6 +42,7 @@ from st.models import (
 from st.utils.config import load_config
 from st.utils.schedulers import build_scheduler
 from st.utils.metrics import compute_wer, compute_bleu, compute_chrf
+from st.utils.ddp_utils import setup_ddp, teardown_ddp, barrier
 
 log = logging.getLogger(__name__)
 
@@ -464,19 +466,28 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_ddp, rank, local_rank, world_size, device_str = setup_ddp()
+    master = (rank == 0)
+    device = torch.device(device_str)
+
+    if master:
+        log.info(f"DDP: {'enabled' if is_ddp else 'disabled'} | "
+                 f"rank={rank} | world_size={world_size} | device={device_str}")
 
     # TF32 on Tensor Cores gives ~10% speedup at no accuracy cost since we
     # train in bfloat16 anyway.
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        log.info(f"CUDA device: {torch.cuda.get_device_name(0)} — TF32 enabled")
+        if master:
+            log.info(f"CUDA device: {torch.cuda.get_device_name(local_rank)} — TF32 enabled")
 
     train_cfg  = cfg["training"]
     data_cfg   = cfg["data"]
     output_dir = train_cfg.get("output_dir", "runs/speech_aura")
-    os.makedirs(output_dir, exist_ok=True)
+    if master:
+        os.makedirs(output_dir, exist_ok=True)
+    barrier()
 
     use_cached = cfg.get("cached_features", {}).get("enabled", False)
     enc_type   = cfg.get("encoder", {}).get("type", "conformer")
@@ -487,13 +498,16 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     else:
         data_mode = "mel"
 
-    # --- Model ---
-    model = build_model(cfg).to(device)
+    # --- Model — build + configure identically on every rank BEFORE DDP-wrapping;
+    # DDP only proxies forward(), not custom attributes/methods like .aura or
+    # .generate(), so all non-forward access below must go through raw_model. ---
+    raw_model = build_model(cfg).to(device)
 
     # Enable gradient checkpointing for full fine-tuning (if LLM is unfrozen)
     if train_cfg.get("unfreeze_llm", False):
-        model.aura.model.gradient_checkpointing_enable()
-        log.info("Gradient checkpointing enabled for AuraLLM")
+        raw_model.aura.model.gradient_checkpointing_enable()
+        if master:
+            log.info("Gradient checkpointing enabled for AuraLLM")
 
     # --- Data ---
     languages = data_cfg.get("languages")
@@ -522,7 +536,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 lowercase=lowercase,
             )
         collator = CachedFeatureCollator(
-            tokenizer=model.aura.tokenizer,
+            tokenizer=raw_model.aura.tokenizer,
             max_target_tokens=train_cfg.get("max_target_tokens", 256),
         )
     elif enc_type == "omniasr_live":
@@ -544,7 +558,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             )
         # No CTC vocab — ctc_weight is guarded to 0.0 for omniasr_live in build_model()
         collator = RawAudioCollator(
-            tokenizer=model.aura.tokenizer,
+            tokenizer=raw_model.aura.tokenizer,
             max_target_tokens=train_cfg.get("max_target_tokens", 256),
         )
     else:
@@ -573,7 +587,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             log.info(f"CTC vocab loaded: {len(vocab)} tokens")
 
         collator = AuraCollator(
-            tokenizer=model.aura.tokenizer,
+            tokenizer=raw_model.aura.tokenizer,
             vocab=vocab,
             max_target_tokens=train_cfg.get("max_target_tokens", 256),
         )
@@ -584,8 +598,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         max_batch_size=train_cfg.get("max_batch_size", 64),
         shuffle=True,
         shuffle_buckets=True,
+        rank=rank, world_size=world_size,
     )
-    log.info(f"Train: {len(train_ds)} samples, {len(train_sampler)} batches/epoch")
+    if master:
+        log.info(f"Train: {len(train_ds)} samples, {len(train_sampler)} per-rank "
+                 f"batches/epoch (world_size={world_size})")
 
     train_loader = DataLoader(
         train_ds,
@@ -594,8 +611,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         collate_fn=collator,
         pin_memory=True,
     )
+    # Validation (loss + generation) only ever runs on master — it's
+    # @torch.no_grad() with no DDP synchronization need, and running it
+    # redundantly on every rank would just waste GPU time for no benefit.
     val_loader = None
-    if val_ds:
+    if val_ds and master:
         val_sampler = DurationBucketSampler(
             dataset=val_ds,
             target_duration=train_cfg.get("max_batch_duration", 120.0),
@@ -616,6 +636,8 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     if val_ds is not None:
         samples_per_lang = train_cfg.get("val_samples_per_lang", 100)
         val_generate_indices = build_val_generate_indices(val_ds, samples_per_lang)
+
+    model = DDP(raw_model, device_ids=[local_rank]) if is_ddp else raw_model
 
     # --- Optimizer ---
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -640,19 +662,21 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         gamma=train_cfg.get("gamma", 1.0),
     )
 
-    # --- Resume ---
+    # --- Resume (load on all ranks so weights + optimizer state are identical
+    # everywhere — resume_from checkpoints hold a raw, unwrapped state, so this
+    # loads into raw_model regardless of is_ddp). ---
     start_step = 0
     if resume_from:
-        step, opt_loaded = load_checkpoint(model, optimizer, scheduler, resume_from)
+        step, opt_loaded = load_checkpoint(raw_model, optimizer, scheduler, resume_from)
         if opt_loaded:
             start_step = step
         else:
             log.info("Transitioning stages: Resetting step counter to 0 for a fresh warmup.")
             start_step = 0
 
-    # --- W&B ---
+    # --- W&B — master only ---
     use_wandb = not train_cfg.get("no_wandb", False)
-    if use_wandb:
+    if master and use_wandb:
         try:
             import wandb
             wandb.init(
@@ -665,6 +689,8 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             log.info(f"W&B: {wandb.run.url}")
         except ImportError:
             use_wandb = False
+    elif not master:
+        use_wandb = False
 
     # --- Training loop ---
     model.train()
@@ -682,9 +708,11 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     micro_step = 0
 
     from tqdm import tqdm
-    pbar = tqdm(total=max_steps - start_step, desc="Training", unit="step", dynamic_ncols=True)
+    pbar = tqdm(total=max_steps - start_step, desc="Training", unit="step",
+                dynamic_ncols=True, disable=not master)
 
-    log.info(f"Training for {max_steps} steps (resuming from {start_step})")
+    if master:
+        log.info(f"Training for {max_steps} steps (resuming from {start_step})")
     optimizer.zero_grad()
 
     while global_step < max_steps:
@@ -752,11 +780,12 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             if global_step % log_every == 0 and run_n > 0 and micro_step % grad_accum == 0:
                 avg   = {k: v / run_n for k, v in running.items()}
                 cur_lr = optimizer.param_groups[0]["lr"]
-                log.info(
-                    f"step {global_step}/{max_steps} | "
-                    + " | ".join(f"{k}={v:.4f}" for k, v in avg.items())
-                    + f" | lr={cur_lr:.2e} | bs={cur_bs} | dur={cur_dur:.0f}s"
-                )
+                if master:
+                    log.info(
+                        f"step {global_step}/{max_steps} | "
+                        + " | ".join(f"{k}={v:.4f}" for k, v in avg.items())
+                        + f" | lr={cur_lr:.2e} | bs={cur_bs} | dur={cur_dur:.0f}s"
+                    )
                 if use_wandb:
                     import wandb
                     wandb.log(
@@ -769,12 +798,14 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 run_n = 0
 
             if global_step % save_every == 0 and micro_step % grad_accum == 0:
-                save_checkpoint(model, optimizer, scheduler, global_step, output_dir)
+                if master:
+                    save_checkpoint(raw_model, optimizer, scheduler, global_step, output_dir)
+                barrier()
 
             if val_loader and global_step % eval_every == 0 and micro_step % grad_accum == 0:
                 torch.cuda.empty_cache()
                 metrics = evaluate(
-                    model, val_loader, device, task,
+                    raw_model, val_loader, device, task,
                     val_generate_indices=val_generate_indices,
                     step=global_step, output_dir=output_dir,
                     mode=data_mode, val_max_batches=val_max_batches,
@@ -786,16 +817,19 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 if use_wandb:
                     import wandb
                     wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=global_step)
+                barrier()
 
             if global_step >= max_steps:
                 break
 
     pbar.close()
-    save_checkpoint(model, optimizer, scheduler, global_step, output_dir)
+    if master:
+        save_checkpoint(raw_model, optimizer, scheduler, global_step, output_dir)
+    barrier()
 
     if val_loader:
         metrics = evaluate(
-            model, val_loader, device, task,
+            raw_model, val_loader, device, task,
             val_generate_indices=val_generate_indices,
             step=global_step, output_dir=output_dir,
             mode=data_mode, val_max_batches=val_max_batches,
@@ -808,6 +842,9 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     if use_wandb:
         import wandb
         wandb.finish()
+
+    barrier()
+    teardown_ddp()
 
     log.info("Training complete.")
 

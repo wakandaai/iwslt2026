@@ -1,0 +1,86 @@
+# Stage 1 v3: continues from Stage 1 v2's encoder_step50000.pt (val/wer=0.2988)
+# for 50k more steps (100k total), but on the FLEURS-augmented index
+# (ASR_INDEX_V5_16k.csv) instead of V4 -- see the stt_bench comparison
+# (Omni-CTC-base vs Omni-CTC-50k) that found full-parameter fine-tuning on
+# V4 regressed FLEURS WER on 11/14 rows because FLEURS made up ~0.1% of that
+# mix, and 9 of those 11 regressed languages had ZERO FLEURS training rows at
+# all. V5 adds 30,294 FLEURS train rows across 11 languages (see
+# .envs/scripts/build_fleurs_augment.py) to correct this at the source,
+# rather than patching around it with model-souping.
+#
+# Switched from 2x H100-80 DDP (stage1_v2.yaml) to 4x V100-32 DDP: the H100
+# allocation was stuck for days on fair-share Priority even with idle
+# capacity elsewhere, while V100-32 had several idle GPUs available.
+# max_batch_duration/max_batch_size dropped to the same values already
+# validated safe (0 OOM) on V100-32 in stage1_omniasr_ctc_22lang_ddp_weighted
+# .yaml; grad_accum(8) x world_size(4) = 32 effective microbatches/step,
+# matching that same config's target (grad_accum(16) x world_size(2) = 32),
+# not H100 stage1_v2's much larger per-microbatch batches -- different
+# hardware, different strategy for reaching a similar step-to-step interval,
+# not a literal match of stage1_v2's own effective batch size.
+#
+# LR schedule (lr/min_lr/warmup/first_cycle_steps/cycle_mult/gamma) kept
+# IDENTICAL to stage1_v2.yaml on purpose: step 50000 is exactly the boundary
+# between its 2nd and 3rd 25k-step cycle, so resuming with the same schedule
+# shape continues cleanly into cycle 3 instead of restarting the cosine
+# curve from an inconsistent point.
+#
+# Must run under .envs/omniasr_extract/bin/python (torch==2.8.0+cu128) via
+# torchrun --standalone --nproc_per_node=4.
+
+encoder:
+  type: omniasr_live
+  checkpoint: checkpoints/omniasr_ctc_1b/omniASR-CTC-1B.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: false
+
+data:
+  train_index:      /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  val_index:        /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  train_split:       train
+  val_split:         dev
+  sp_tokenizer_path: checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
+  languages:          null   # null = all 22 languages in the index
+  max_duration:       20.0
+  min_duration:       0.5
+  max_target_tokens:  400
+  lowercase:          true
+
+training:
+  output_dir: runs/stage1_v3_fleurs
+
+  max_steps: 100000
+  lr: 1.0e-5
+  min_lr: 1.0e-7
+  warmup_steps: 500
+  first_cycle_steps: 25000
+  cycle_mult: 1.0
+  gamma: 1.0
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 8
+
+  max_batch_duration: 10.0
+  max_batch_size: 2
+  num_workers: 4
+
+  sampling:
+    strategy: weighted_language
+    beta_language: 0.7
+    num_batches: 3500000   # max_steps(100000) * grad_accum(8) * world_size(4) = 3,200,000 + buffer
+    seed: 42
+
+  log_every: 20
+  save_every: 2500
+  eval_every: 2500
+  val_samples_per_lang: 30
+  val_batch_size: 2
+
+  no_wandb: false
+  wandb_project: aura-mt
+  wandb_entity: etanghan-carnegie-mellon-university
+  wandb_run_name: stage1_v3_fleurs

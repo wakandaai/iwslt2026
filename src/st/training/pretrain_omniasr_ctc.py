@@ -346,7 +346,14 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     # state_dict, so this loads into raw_model regardless of is_ddp). ---
     start_step = 0
     if resume_from:
-        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        # map_location="cpu" (not `device`): loading straight to GPU put the
+        # whole checkpoint (weights + AdamW's m/v buffers, ~11.7GB) on-device
+        # at once, on every rank, alongside the already-constructed model/
+        # optimizer -- a transient ~27GB peak before the first training step
+        # even ran. Fine on H100-80 (never caught there); OOM'd immediately
+        # on V100-32. load_state_dict() copies CPU tensors to each param's
+        # existing device itself, so staging on CPU changes nothing else.
+        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
         raw_model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if scheduler and ckpt.get("scheduler_state_dict"):
@@ -354,6 +361,8 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         start_step = ckpt.get("step", 0)
         if master:
             log.info(f"Resumed from {resume_from} at step {start_step}")
+        del ckpt
+        torch.cuda.empty_cache()
 
     # --- W&B — master only ---
     use_wandb = not train_cfg.get("no_wandb", False)

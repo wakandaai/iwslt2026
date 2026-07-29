@@ -22,16 +22,40 @@ import torch.nn as nn
 
 log = logging.getLogger(__name__)
 
-# Language token IDs — the checkpoint's real special_tokens.json language tags
-# (<|bem_Latn|>, <|eng_Latn|>, <|hau_Latn|>, <|ibo_Latn|>, <|yor_Latn|>), not
-# an arbitrary reserved-slot scheme. Confirmed against the checkpoint's own
-# special_tokens.json, not guessed.
+# Language token IDs — the checkpoint's real tokenizer.json added_tokens
+# (<|bem_Latn|>, <|eng_Latn|>, etc.), not an arbitrary reserved-slot scheme.
+# Confirmed against the checkpoint's own tokenizer.json, not guessed.
+#
+# Covers 21 of our 22 trained languages (see ASR_INDEX_V5_16k.csv) — every one
+# except Tsonga, which has no dedicated tag in this tokenizer (the closest
+# entry, tsn_Latn, is Tswana — a different language, not a valid substitute).
+# Previously only 5 of 22 were mapped here; the other 17 (now 16) silently
+# fell back to the English tag in both training and inference, meaning most
+# languages were trained/generated under the wrong language conditioning.
+# Tsonga still falls back to English below — a known, isolated gap, not a
+# silent one.
 LANG_MAP: dict[str, int] = {
-    "bemba": 7,  "bem": 7,
-    "yoruba": 27, "yor": 27,
-    "hausa": 11,  "hau": 11,
-    "igbo": 12,   "ibo": 12,
-    "english": 8, "eng": 8,
+    "afrikaans": 4,     "afr": 4,
+    "amharic": 5,       "amh": 5,
+    "arabic": 6,        "arb": 6,
+    "bemba": 7,         "bem": 7,
+    "english": 8,       "eng": 8,
+    "french": 10,       "fra": 10,
+    "hausa": 11,        "hau": 11,
+    "igbo": 12,         "ibo": 12,
+    "kinyarwanda": 13,  "kin": 13,
+    "lingala": 14,      "lin": 14,
+    "luganda": 15,      "lug": 15,
+    "malagasy": 17,     "plt": 17,
+    "portuguese": 18,   "por": 18,
+    "shona": 19,        "sna": 19,
+    "sotho": 21,        "sot": 21,
+    "swahili": 22,      "swh": 22,
+    "tigrinya": 23,     "tir": 23,
+    "tswana": 24,       "tsn": 24,
+    "xhosa": 26,        "xho": 26,
+    "yoruba": 27,       "yor": 27,
+    "zulu": 28,         "zul": 28,
 }
 
 # Task marker tokens — also real special_tokens.json entries, not reserved

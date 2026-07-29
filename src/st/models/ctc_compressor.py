@@ -36,11 +36,14 @@ Literature context:
 
 from __future__ import annotations
 
+import logging
 from itertools import groupby
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+log = logging.getLogger(__name__)
 
 
 class CTCCompressor(nn.Module):

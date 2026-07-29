@@ -21,9 +21,11 @@ import csv
 import gc
 import logging
 import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -31,7 +33,7 @@ from torch.utils.data import DataLoader
 from st.data import (
     SpeechDataset, AuraCollator,
     CachedFeatureDataset, CachedFeatureCollator,
-    RawAudioDataset, RawAudioCollator,
+    RawAudioDataset, RawAudioCollator, RawAudioAuxCTCCollator,
     DurationBucketSampler,
 )
 from st.models import (
@@ -120,12 +122,28 @@ def build_model(cfg: dict) -> SpeechAura:
         task=train_cfg.get("task", "transcribe"),
     )
 
+    aux_ctc_weight = train_cfg.get("aux_ctc_weight", 0.0)
+    aux_ctc_vocab_size = None
+    if aux_ctc_weight > 0.0:
+        if use_cached:
+            raise ValueError(
+                "aux_ctc_weight > 0 requires the live (non-cached) encoder path — "
+                "see SpeechAura.forward_cached()'s guard. Set aux_ctc_weight: 0.0 "
+                "for cached_features runs."
+            )
+        # Lazy import — same reasoning as the omniasr_live branch above: avoid a
+        # hard fairseq2 dependency for configs that don't need this vocab size.
+        from st.models.omniasr_encoder import CTC_VOCAB_SIZE
+        aux_ctc_vocab_size = CTC_VOCAB_SIZE
+
     model = SpeechAura(
         encoder=encoder,
         aura=aura,
         projector_cfg=proj_cfg,
         ctc_compress_cfg=ctc_comp_cfg,
         ctc_weight=train_cfg.get("ctc_weight", 0.0),
+        aux_ctc_weight=aux_ctc_weight,
+        aux_ctc_vocab_size=aux_ctc_vocab_size,
         freeze_encoder=not train_cfg.get("unfreeze_encoder", False),
         freeze_llm=freeze_llm,
         encoder_output_dim=encoder_output_dim,
@@ -290,6 +308,8 @@ def run_forward(model: SpeechAura, batch: dict, cached: bool) -> dict[str, torch
         languages=batch["language"],
         ctc_labels=batch.get("ctc_labels"),
         ctc_label_lengths=batch.get("ctc_label_lengths"),
+        proj_ctc_labels=batch.get("proj_ctc_labels"),
+        proj_ctc_label_lengths=batch.get("proj_ctc_label_lengths"),
     )
 
 
@@ -317,7 +337,7 @@ def evaluate(
     cached = mode == "cached"
 
     model.eval()
-    total_loss, n = 0.0, 0
+    total_loss, total_ce_loss, n = 0.0, 0.0, 0
 
     # val_loader is built from the full dev split (can be 100k+ examples) —
     # a full-model forward pass here (encoder+compressor+projector+LLM) is far
@@ -334,9 +354,16 @@ def evaluate(
                                 enabled=(device.type == "cuda")):
             out = run_forward(model, batch, cached)
         total_loss += out["loss"].item()
+        total_ce_loss += out["ce_loss"].item()
         n += 1
 
-    results: dict[str, float] = {"loss": total_loss / max(n, 1)}
+    # "loss" mixes in aux_ctc_weight/ctc_weight-scaled terms, so it isn't
+    # comparable across runs with different weights (e.g. an aux_ctc ablation)
+    # — ce_loss alone is the fair, apples-to-apples comparison point.
+    results: dict[str, float] = {
+        "loss": total_loss / max(n, 1),
+        "ce_loss": total_ce_loss / max(n, 1),
+    }
     torch.cuda.empty_cache()
 
     # Generation over fixed val indices (first N per language)
@@ -556,11 +583,21 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 max_duration=data_cfg.get("max_duration", 20.0),
                 lowercase=lowercase,
             )
-        # No CTC vocab — ctc_weight is guarded to 0.0 for omniasr_live in build_model()
-        collator = RawAudioCollator(
-            tokenizer=raw_model.aura.tokenizer,
-            max_target_tokens=train_cfg.get("max_target_tokens", 256),
-        )
+        aux_ctc_weight = train_cfg.get("aux_ctc_weight", 0.0)
+        if aux_ctc_weight > 0.0:
+            # Same tokenizer as aux_ctc_head's vocab (CTC_VOCAB_SIZE in build_model()).
+            from st.training.pretrain_omniasr_ctc import load_sp_tokenizer
+            sp_tokenizer = load_sp_tokenizer(data_cfg["sp_tokenizer_path"])
+            collator = RawAudioAuxCTCCollator(
+                tokenizer=raw_model.aura.tokenizer,
+                sp_tokenizer=sp_tokenizer,
+                max_target_tokens=train_cfg.get("max_target_tokens", 256),
+            )
+        else:
+            collator = RawAudioCollator(
+                tokenizer=raw_model.aura.tokenizer,
+                max_target_tokens=train_cfg.get("max_target_tokens", 256),
+            )
     else:
         train_ds = SpeechDataset(
             index_path=data_cfg["train_index"],
@@ -678,6 +715,15 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     use_wandb = not train_cfg.get("no_wandb", False)
     if master and use_wandb:
         try:
+            # WANDB_SILENT suppresses wandb's "Logged in as ..." banner, which
+            # is NOT cosmetic here: printing it calls _print_logged_in_message()
+            # -> _get_username() -> Server.query_with_timeout(), and wandb
+            # 0.21.3's version of that does json.loads(viewer.get("flags", "{}")),
+            # which raises TypeError when the server legitimately returns
+            # flags: null (the "{}" default only covers a *missing* key). Every
+            # .sbatch here already exports this; setdefault means a run launched
+            # any other way (srun, bare python) can't miss it and crash.
+            os.environ.setdefault("WANDB_SILENT", "true")
             import wandb
             wandb.init(
                 project=train_cfg.get("wandb_project", "iwslt2026"),
@@ -688,6 +734,17 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             )
             log.info(f"W&B: {wandb.run.url}")
         except ImportError:
+            use_wandb = False
+        except Exception as e:
+            # wandb.init() talks to a remote server (auth, viewer info, etc.)
+            # and has genuine bugs in how it handles some server responses
+            # (e.g. a real one hit this session: wandb 0.21.3's server.py
+            # does `json.loads(self._viewer.get("flags", "{}"))`, which
+            # crashes with TypeError if the server legitimately returns
+            # flags: null — the "{}" default only covers a missing key, not
+            # an explicit null). Remote logging going down should never take
+            # an expensive training run down with it — log and continue.
+            log.warning(f"wandb.init() failed, continuing without W&B logging: {e}")
             use_wandb = False
     elif not master:
         use_wandb = False
@@ -703,7 +760,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     val_max_batches = train_cfg.get("val_max_batches", 50)
     oom_cooldown  = 0
 
-    running: dict[str, float] = {"loss": 0.0, "ce_loss": 0.0, "ctc_loss": 0.0}
+    running: dict[str, float] = {"loss": 0.0, "ce_loss": 0.0, "ctc_loss": 0.0, "aux_ctc_loss": 0.0}
     run_n = 0
     micro_step = 0
 
@@ -718,7 +775,20 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     while global_step < max_steps:
         epoch += 1
         for batch in train_loader:
-            if batch is None or oom_cooldown > 0:
+            # The skip decision (None batch, or OOM cooldown) must be
+            # IDENTICAL on every rank: under DDP, every backward() call
+            # below triggers a full gradient allreduce (no no_sync() guards
+            # it), so if one rank skips via `continue` while others proceed
+            # to backward(), the proceeding ranks enter that collective and
+            # wait forever for a rank that never joins it — a real hang, not
+            # just a correctness issue. Sync via all_reduce(MAX) so every
+            # rank makes the same call before anyone acts on it.
+            skip = int(batch is None or oom_cooldown > 0)
+            if is_ddp:
+                flags = torch.tensor([oom_cooldown, skip], dtype=torch.int32, device=device)
+                dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+                oom_cooldown, skip = int(flags[0].item()), int(flags[1].item())
+            if skip:
                 oom_cooldown = max(0, oom_cooldown - 1)
                 continue
 
@@ -731,21 +801,46 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             cur_bs  = batch[features_key].size(0)
             cur_dur = batch[lengths_key].sum().item() * frame_seconds
 
+            oom_this_step = False
+            out = loss = None
+            # Only the microbatch that CLOSES an accumulation window should
+            # allreduce gradients — no_sync() suppresses it on the others, so
+            # DDP pays 1 allreduce per optimizer step instead of grad_accum
+            # of them (all ranks agree on micro_step via the skip/OOM sync
+            # above and below, so they agree on which window closes too).
+            closes_window = (micro_step + 1) % grad_accum == 0
+            sync_ctx = model.no_sync() if (is_ddp and not closes_window) else nullcontext()
             try:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                        enabled=(device.type == "cuda")):
-                    out = run_forward(model, batch, use_cached)
-                    loss = out["loss"] / grad_accum
-
-                loss.backward()
-
+                with sync_ctx:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                            enabled=(device.type == "cuda")):
+                        out = run_forward(model, batch, use_cached)
+                        loss = out["loss"] / grad_accum
+                    loss.backward()
             except torch.cuda.OutOfMemoryError:
-                log.warning(
-                    f"OOM at step {global_step}: bs={cur_bs} — skipping"
-                )
+                oom_this_step = True
+                # out/loss must be reassigned to None (not just left to the
+                # except's implicit scope) or the leaked forward graph
+                # prevents empty_cache() from reclaiming memory, causing
+                # every retry at this step to OOM again regardless of size.
+                out = loss = None
                 optimizer.zero_grad(set_to_none=True)
-                torch.cuda.empty_cache()
                 gc.collect()
+                torch.cuda.empty_cache()
+
+            # Sync OOM across ranks BEFORE anyone treats this step as done —
+            # a rank that succeeded still must reset alongside a rank that
+            # OOM'd, or their microbatch counts (and no_sync() window
+            # boundaries) permanently diverge.
+            if is_ddp:
+                oom_tensor = torch.tensor(int(oom_this_step), dtype=torch.int32, device=device)
+                dist.all_reduce(oom_tensor, op=dist.ReduceOp.MAX)
+                oom_this_step = bool(oom_tensor.item())
+
+            if oom_this_step:
+                if master:
+                    log.warning(f"OOM at step {global_step}: bs={cur_bs} — all ranks skipping")
+                optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 oom_cooldown = 3
                 micro_step = (micro_step // grad_accum) * grad_accum
@@ -754,7 +849,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
                 continue
 
             # Accumulate metrics (unscaled)
-            for k in ("loss", "ce_loss", "ctc_loss"):
+            for k in ("loss", "ce_loss", "ctc_loss", "aux_ctc_loss"):
                 running[k] += out[k].item()
             run_n += 1
             micro_step += 1
@@ -778,7 +873,19 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             )
 
             if global_step % log_every == 0 and run_n > 0 and micro_step % grad_accum == 0:
-                avg   = {k: v / run_n for k, v in running.items()}
+                # Sum-then-divide across ranks so `avg` is the true global mean
+                # over this log_every window, not just master's own
+                # microbatches (this previously computed a purely local
+                # average on every rank with no cross-rank reduction at all).
+                keys = list(running.keys())
+                stats = torch.tensor(
+                    [running[k] for k in keys] + [float(run_n)],
+                    dtype=torch.float64, device=device,
+                )
+                if is_ddp:
+                    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                total_n = stats[-1].item()
+                avg = {k: (stats[i] / total_n).item() for i, k in enumerate(keys)}
                 cur_lr = optimizer.param_groups[0]["lr"]
                 if master:
                     log.info(
@@ -804,19 +911,30 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
             if val_loader and global_step % eval_every == 0 and micro_step % grad_accum == 0:
                 torch.cuda.empty_cache()
-                metrics = evaluate(
-                    raw_model, val_loader, device, task,
-                    val_generate_indices=val_generate_indices,
-                    step=global_step, output_dir=output_dir,
-                    mode=data_mode, val_max_batches=val_max_batches,
-                )
-                log.info(
-                    f"step {global_step} val | "
-                    + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-                )
-                if use_wandb:
-                    import wandb
-                    wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=global_step)
+                # Master-only: evaluate() was previously called by every rank
+                # redundantly (2-4x the generation-eval compute for no benefit,
+                # since only master's result was ever logged), and with
+                # barely-trained checkpoints prone to repetition loops, one
+                # rank's generation pass running long enough blew past NCCL's
+                # collective timeout and killed a real Stage 2 job mid-eval.
+                if master:
+                    metrics = evaluate(
+                        raw_model, val_loader, device, task,
+                        val_generate_indices=val_generate_indices,
+                        step=global_step, output_dir=output_dir,
+                        mode=data_mode, val_max_batches=val_max_batches,
+                    )
+                    log.info(
+                        f"step {global_step} val | "
+                        + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+                    )
+                    if use_wandb:
+                        import wandb
+                        wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=global_step)
+                # evaluate() leaves the model in eval() mode and never restores
+                # it — previously this meant dropout silently stayed off for
+                # the rest of training after the first eval, on every rank.
+                raw_model.train()
                 barrier()
 
             if global_step >= max_steps:
@@ -827,7 +945,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         save_checkpoint(raw_model, optimizer, scheduler, global_step, output_dir)
     barrier()
 
-    if val_loader:
+    if val_loader and master:
         metrics = evaluate(
             raw_model, val_loader, device, task,
             val_generate_indices=val_generate_indices,
@@ -838,6 +956,7 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
         if use_wandb:
             import wandb
             wandb.log({f"val/{k}": v for k, v in metrics.items()}, step=global_step)
+    barrier()
 
     if use_wandb:
         import wandb

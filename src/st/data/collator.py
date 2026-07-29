@@ -262,6 +262,61 @@ class RawAudioCollator:
 
 
 @dataclass
+class RawAudioAuxCTCCollator:
+    """Same as RawAudioCollator, plus proj_ctc_labels for SpeechAura's
+    aux_ctc_weight (projector CTC head) — separate from ctc_weight, which
+    supervises the encoder's own CTC head and is off for omniasr_live.
+
+    proj_ctc_labels use the same SentencePiece tokenizer (omniASR_tokenizer.model)
+    as the encoder's own pretrained CTC head.
+
+    Kept separate from RawAudioCollator so configs with aux_ctc_weight=0 skip
+    the extra tokenization cost.
+
+    Args:
+        tokenizer:         Aura tokenizer — for target_ids.
+        sp_tokenizer:      SentencePieceProcessor — for proj_ctc_labels.
+        max_target_tokens: Drop samples whose Aura target exceeds this token count.
+    """
+
+    tokenizer:         Any
+    sp_tokenizer:      Any
+    max_target_tokens: int = 256
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any] | None:
+        keep, target_ids_list = _tokenize_targets(batch, self.tokenizer, self.max_target_tokens)
+
+        if not keep:
+            return None
+
+        wave_lens = torch.tensor([batch[i]["waveform_len"] for i in keep], dtype=torch.long)
+        max_len   = int(wave_lens.max().item())
+        wave_pad  = torch.zeros(len(keep), max_len)
+        for j, i in enumerate(keep):
+            b = batch[i]
+            wave_pad[j, : b["waveform_len"]] = b["waveform"]
+
+        target_pad, target_lens = _pad_target_ids(target_ids_list)
+
+        proj_ctc_list: list[torch.Tensor] = []
+        for i in keep:
+            text = _strip_ctc_unsupported_punct(batch[i]["text"])
+            ids  = self.sp_tokenizer.encode(text, out_type=int)
+            proj_ctc_list.append(torch.tensor(ids, dtype=torch.long))
+        proj_ctc_pad, proj_ctc_lens = _pad_target_ids(proj_ctc_list)
+
+        return {
+            "audio_features": wave_pad,                                # (B, T_samples)
+            "audio_lengths":  wave_lens,                                # (B,)
+            "target_ids":     target_pad,                               # (B, L_target)
+            "target_lengths": target_lens,                              # (B,)
+            "language":       [batch[i]["language"] for i in keep],
+            "proj_ctc_labels":        proj_ctc_pad,                     # (B, L_ctc)
+            "proj_ctc_label_lengths": proj_ctc_lens,                    # (B,)
+        }
+
+
+@dataclass
 class CTCRawAudioCollator:
     """Collator for RawAudioDataset batches feeding a standalone CTC loss
     against omniASR_CTC_1B's own 9812-piece SentencePiece vocab (Stage 1

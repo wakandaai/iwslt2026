@@ -45,8 +45,20 @@ class SpeechAura(nn.Module):
         aura:           AuraLLM wrapper (already loaded + frozen/unfrozen as desired).
         projector_cfg:  Dict passed to build_projector().
         ctc_compress_cfg: Dict passed to build_ctc_compressor(). None = disabled.
-        ctc_weight:     Weight for auxiliary CTC loss (0.0 = disabled). Must be 0.0
-                        when encoder is None (cached mode has no live ctc_logits).
+        ctc_weight:     Weight for the encoder's own auxiliary CTC loss (0.0 = disabled,
+                        and forced to 0.0 for omniasr_live encoders — see build_model()).
+                        Operates on ctc_logits pre-compression/pre-projection; keeps the
+                        ENCODER grounded during ST training. Must be 0.0 when encoder is
+                        None (cached mode has no live ctc_logits).
+        aux_ctc_weight: Weight for a SEPARATE auxiliary CTC loss on the PROJECTOR's own
+                        output (0.0 = disabled). A linear head maps the projector's
+                        output — computed on the UNCOMPRESSED hidden states, per
+                        Soundwave (arxiv 2502.12900) — to aux_ctc_vocab_size logits,
+                        supervised by proj_ctc_labels. Gives the projector a direct
+                        training signal without backprop through the full frozen LLM.
+        aux_ctc_vocab_size: Vocab size for the aux CTC head (must match whatever
+                        tokenizer produced proj_ctc_labels — e.g. omniASR's own
+                        9812-piece SentencePiece vocab). Required when aux_ctc_weight > 0.
         freeze_encoder: Freeze encoder weights. Ignored when encoder is None.
         freeze_llm:     Freeze LLM weights (set False for full fine-tune).
         encoder_output_dim: Encoder hidden dim, required when encoder is None
@@ -60,6 +72,8 @@ class SpeechAura(nn.Module):
         projector_cfg: dict,
         ctc_compress_cfg: dict | None = None,
         ctc_weight: float = 0.0,
+        aux_ctc_weight: float = 0.0,
+        aux_ctc_vocab_size: int | None = None,
         freeze_encoder: bool = True,
         freeze_llm: bool = True,
         encoder_output_dim: int | None = None,
@@ -68,7 +82,14 @@ class SpeechAura(nn.Module):
 
         self.encoder = encoder
         self.aura    = aura
-        self.ctc_weight = ctc_weight
+        self.ctc_weight     = ctc_weight
+        self.aux_ctc_weight = aux_ctc_weight
+
+        if aux_ctc_weight > 0.0 and aux_ctc_vocab_size is None:
+            raise ValueError(
+                "aux_ctc_weight > 0 requires aux_ctc_vocab_size (must match whatever "
+                "tokenizer produced proj_ctc_labels)."
+            )
 
         if encoder is not None:
             # Freeze / unfreeze components
@@ -99,6 +120,12 @@ class SpeechAura(nn.Module):
                     "ctc_weight > 0 requires a live encoder with ctc_logits — cached-features "
                     "mode only stores argmax predicted_ids, not per-frame logits. Set ctc_weight=0.0."
                 )
+            if aux_ctc_weight > 0.0:
+                raise ValueError(
+                    "aux_ctc_weight > 0 is not wired into forward_cached() yet — "
+                    "cached-features mode isn't used by Stage 2 currently. Set aux_ctc_weight=0.0, "
+                    "or extend forward_cached() to accept proj_ctc_labels if this is needed later."
+                )
             self._encoder_output_dim = encoder_output_dim
 
         if freeze_llm:
@@ -124,6 +151,15 @@ class SpeechAura(nn.Module):
         log.info(f"  Projector ({projector_cfg.get('type', 'mlp')}): {n:,} params")
         self.projector_dtype = next(self.projector.parameters()).dtype
 
+        # Auxiliary CTC head on the projector's own output (separate from the
+        # encoder's own ctc_head/ctc_weight above — see docstring).
+        self.aux_ctc_head: nn.Linear | None = None
+        if aux_ctc_weight > 0.0:
+            self.aux_ctc_head = nn.Linear(aura.hidden_size, aux_ctc_vocab_size)
+            n_aux = sum(p.numel() for p in self.aux_ctc_head.parameters())
+            log.info(f"  Aux CTC head enabled: vocab={aux_ctc_vocab_size}, {n_aux:,} params, "
+                     f"weight={aux_ctc_weight}")
+
         # Summary
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total     = sum(p.numel() for p in self.parameters())
@@ -147,11 +183,14 @@ class SpeechAura(nn.Module):
             ctc_logits:   (B, T_enc, vocab) or None — pre-compression, for CTC loss
             enc_lengths:  (B,) encoder output lengths BEFORE compression, or None
                           Same as lengths when compressor is disabled.
+            hidden_uncompressed: (B, T_enc, D) encoder hidden states BEFORE
+                          compression — used by the aux CTC loss (see forward()).
         """
         enc_out    = self.encoder(features, feature_lengths)
         hidden     = enc_out["hidden_states"]   # (B, T_enc, D)
         enc_lengths = enc_out["lengths"]         # (B,) — pre-compression
         ctc_logits = enc_out.get("ctc_logits")  # (B, T_enc, V) or None
+        hidden_uncompressed = hidden
 
         # Optional CTC compression — enc_lengths stays at pre-compression value
         # so the CTC loss uses the correct uncompressed sequence lengths
@@ -160,7 +199,7 @@ class SpeechAura(nn.Module):
             hidden, lengths = self.ctc_compressor(hidden, ctc_logits, enc_lengths)
 
         projected = self.projector(hidden, lengths)
-        return projected, lengths, ctc_logits, enc_lengths
+        return projected, lengths, ctc_logits, enc_lengths, hidden_uncompressed
 
     def encode_audio_cached(
         self,
@@ -321,20 +360,23 @@ class SpeechAura(nn.Module):
         target_ids: torch.Tensor,       # (B, L_target) padded target token ids
         target_lengths: torch.Tensor,   # (B,) actual target lengths
         languages: list[str],           # (B,) language codes
-        ctc_labels: torch.Tensor | None = None,         # (B, L) for aux CTC loss
+        ctc_labels: torch.Tensor | None = None,         # (B, L) for encoder's own aux CTC loss
         ctc_label_lengths: torch.Tensor | None = None,  # (B,)
+        proj_ctc_labels: torch.Tensor | None = None,        # (B, L) for projector aux CTC loss
+        proj_ctc_label_lengths: torch.Tensor | None = None, # (B,)
     ) -> dict[str, torch.Tensor]:
         """
         Returns dict with:
-            loss:      scalar — CE loss + ctc_weight * CTC loss
-            ce_loss:   scalar
-            ctc_loss:  scalar (0.0 if disabled)
-            logits:    (B, S, vocab_size)
+            loss:         scalar — CE loss + ctc_weight*ctc_loss + aux_ctc_weight*aux_ctc_loss
+            ce_loss:      scalar
+            ctc_loss:     scalar (0.0 if disabled) — encoder's own CTC head, pre-compression
+            aux_ctc_loss: scalar (0.0 if disabled) — projector's own CTC head, pre-compression
+            logits:       (B, S, vocab_size)
         """
         device = audio_features.device
 
         # 1. Encode audio — single forward, get actual post-compression lengths
-        audio_embeds, audio_lens, ctc_logits, enc_lengths = self.encode_audio(
+        audio_embeds, audio_lens, ctc_logits, enc_lengths, hidden_uncompressed = self.encode_audio(
             audio_features, audio_lengths
         )
 
@@ -355,7 +397,7 @@ class SpeechAura(nn.Module):
             ignore_index=-100,
         )
 
-        # 5. Auxiliary CTC loss
+        # 5. Auxiliary CTC loss — encoder's own CTC head, pre-compression
         ctc_loss = torch.tensor(0.0, device=device)
         if self.ctc_weight > 0.0 and ctc_logits is not None:
             if ctc_labels is None or ctc_label_lengths is None:
@@ -367,13 +409,46 @@ class SpeechAura(nn.Module):
                     blank=0, reduction="mean", zero_infinity=True,
                 )
 
-        loss = ce_loss + self.ctc_weight * ctc_loss
+        # 6. Auxiliary CTC loss — projector's own head, on the UNCOMPRESSED
+        # (full T_enc resolution) output, not the compressed one that feeds the
+        # LLM. Matches Soundwave (arxiv 2502.12900): its CTC alignment loss runs
+        # on the adapter's full-resolution output; shrinking is a separate,
+        # never-CTC-supervised step downstream. Running it post-compression
+        # instead (our first attempt) was structurally infeasible ~65-69% of
+        # the time, since compressed segment count isn't guaranteed to reach
+        # the target token count. Full-res enc_lengths always does.
+        # self.projector is shared with the compressed path, so gradients here
+        # still train the deployed projector.
+        aux_ctc_loss = torch.tensor(0.0, device=device)
+        if self.aux_ctc_head is not None:
+            if proj_ctc_labels is None or proj_ctc_label_lengths is None:
+                log.warning("aux_ctc_weight > 0 but proj_ctc_labels not provided — skipping.")
+            else:
+                proj_uncompressed = self.projector(hidden_uncompressed, enc_lengths)
+                aux_logits = self.aux_ctc_head(proj_uncompressed)  # (B, T_enc, aux_ctc_vocab_size)
+                aux_log_probs = aux_logits.log_softmax(dim=-1).transpose(0, 1)  # (T_enc, B, V)
+
+                infeasible = (proj_ctc_label_lengths > enc_lengths).sum().item()
+                if infeasible > 0:
+                    log.warning(
+                        f"aux CTC: {infeasible}/{enc_lengths.size(0)} samples still have "
+                        f"proj_ctc_label_lengths > enc_lengths (full-resolution frames) — "
+                        f"unexpected at this resolution, zero_infinity silently drops these."
+                    )
+
+                aux_ctc_loss = F.ctc_loss(
+                    aux_log_probs, proj_ctc_labels, enc_lengths, proj_ctc_label_lengths,
+                    blank=0, reduction="mean", zero_infinity=True,
+                )
+
+        loss = ce_loss + self.ctc_weight * ctc_loss + self.aux_ctc_weight * aux_ctc_loss
 
         return {
-            "loss":     loss,
-            "ce_loss":  ce_loss,
-            "ctc_loss": ctc_loss,
-            "logits":   logits,
+            "loss":         loss,
+            "ce_loss":      ce_loss,
+            "ctc_loss":     ctc_loss,
+            "aux_ctc_loss": aux_ctc_loss,
+            "logits":       logits,
         }
 
     def forward_cached(
@@ -386,9 +461,10 @@ class SpeechAura(nn.Module):
         languages: list[str],            # (B,) language codes
     ) -> dict[str, torch.Tensor]:
         """Same as forward(), but for precomputed encoder features (see
-        CachedFeatureDataset/CachedFeatureCollator). No auxiliary CTC loss —
-        cached mode has no per-frame ctc_logits to supervise it from (enforced
-        at __init__ time: ctc_weight must be 0.0 when encoder is None).
+        CachedFeatureDataset/CachedFeatureCollator). Neither auxiliary CTC loss
+        is available here: ctc_weight needs per-frame ctc_logits this mode
+        doesn't have, and aux_ctc_weight isn't wired into this path yet (both
+        enforced at __init__ time — must be 0.0 when encoder is None).
 
         Returns dict with:
             loss:    scalar — CE loss only
@@ -442,7 +518,7 @@ class SpeechAura(nn.Module):
         from st.models.kvcache import KVcache
 
         device = audio_features.device
-        audio_embeds, audio_lens, _, _ = self.encode_audio(audio_features, audio_lengths)
+        audio_embeds, audio_lens, _, _, _ = self.encode_audio(audio_features, audio_lengths)
         n_audio = int(audio_lens[0].item())
 
         # Build prompt embeddings: [BOS, LANG, audio×N, TRANSCRIPT_START]
@@ -587,6 +663,9 @@ class SpeechAura(nn.Module):
 
         torch.save(self.projector.state_dict(), f"{directory}/projector.pt")
 
+        if self.aux_ctc_head is not None:
+            torch.save(self.aux_ctc_head.state_dict(), f"{directory}/aux_ctc_head.pt")
+
         if self.encoder is not None and any(p.requires_grad for p in self.encoder.parameters()):
             torch.save(self.encoder.state_dict(), f"{directory}/encoder.pt")
 
@@ -613,6 +692,17 @@ class SpeechAura(nn.Module):
         self.projector.load_state_dict(
             torch.load(f"{directory}/projector.pt", map_location="cpu", weights_only=True)
         )
+        aux_ctc_head_path = f"{directory}/aux_ctc_head.pt"
+        if self.aux_ctc_head is not None and os.path.exists(aux_ctc_head_path):
+            self.aux_ctc_head.load_state_dict(
+                torch.load(aux_ctc_head_path, map_location="cpu", weights_only=True)
+            )
+            log.info(f"Aux CTC head loaded ← {aux_ctc_head_path}")
+        elif self.aux_ctc_head is not None:
+            log.warning(
+                f"aux_ctc_weight > 0 but no aux_ctc_head.pt found in {directory} — "
+                "resuming with a freshly-initialized aux CTC head (checkpoint predates this fix)."
+            )
         encoder_path = f"{directory}/encoder.pt"
         if self.encoder is not None and os.path.exists(encoder_path):
             self.encoder.load_state_dict(

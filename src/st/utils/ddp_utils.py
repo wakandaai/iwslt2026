@@ -15,9 +15,18 @@ Launch with torchrun:
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+
+# NCCL's default collective timeout (10 min) is too short for this codebase:
+# generation-based eval (evaluate()'s WER pass) can legitimately run close to
+# or past 10 minutes on its own even without a stuck/repetition-looping
+# sample — a real Stage 2 job hit exactly this and got killed by the process
+# group watchdog mid-eval. 60 min gives real headroom without masking an
+# actual hang (a genuinely stuck job still dies, just later).
+_DDP_TIMEOUT = timedelta(minutes=60)
 
 
 def setup_ddp() -> tuple[bool, int, int, int, str]:
@@ -32,7 +41,7 @@ def setup_ddp() -> tuple[bool, int, int, int, str]:
     """
     if int(os.environ.get("RANK", -1)) != -1:
         assert torch.cuda.is_available(), "DDP requires CUDA"
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=_DDP_TIMEOUT)
         rank       = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])

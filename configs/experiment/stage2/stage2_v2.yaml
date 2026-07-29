@@ -1,18 +1,27 @@
-# Stage 2 v2: frozen encoder computed live (no feature cache — full 22-lang
-# cache would need ~4TB vs ~4.4TB free). Projector-only training; encoder +
-# LLM both frozen. checkpoint = Stage 1 v2 output (encoder_step50000.pt,
-# val/wer=0.2988 — the fixed/clean pipeline, better than v1's 0.3265).
-# Fresh run, not a --resume_from of stage2_v1's checkpoint_step9000 — that
-# projector was trained against v1's encoder feature space specifically and
-# doesn't transfer to a different frozen encoder.
+# Stage 2 v2: frozen encoder computed live. Projector-only training; encoder
+# + LLM both frozen. checkpoint = Stage 1 v3 output (encoder_step100000.pt,
+# trained on ASR_INDEX_V5_16k.csv). train_index/val_index also V5, so the
+# projector doesn't inherit V4's FLEURS blind spot.
+#
+# aux_ctc_weight=0.3: auxiliary CTC loss on the projector's own (pre-compression)
+# output — see speech_aura.py's aux_ctc_head block. 0.3 matches ESPnet's hybrid
+# CTC/attention default and the 2025 LLM-CTC regularization paper's grid-search
+# optimum (arxiv 2506.22846); also empirically validated on this exact model via
+# a paired 3000-step ablation (~16% lower val WER than aux_ctc_weight=0.0, no
+# ce_loss cost).
+#
+# Runs on 4x V100-32 DDP, not H100 — H100 nodes were all in fair-share
+# Priority/mix state (same queueing problem Stage 1 v3 hit). max_batch_size=4,
+# grad_accum=4 are NOT unvalidated guesses here: they're the exact per-GPU
+# settings the aux_ctc ablation (configs/experiment/stage2/ablation/) already
+# ran cleanly for 3000 real steps on a single V100-32, no OOM — this just
+# parallelizes that proven setting across 4 GPUs via DDP.
 #
 # Must run under .envs/omniasr_extract (torch==2.8.0+cu128), not Aura_base/env.
-# Batch settings below are UNVALIDATED (reasoned, not smoke-tested) — see
-# docs/stage1_omniasr_ctc_guide.md for the reasoning and full context.
 
 encoder:
   type: omniasr_live
-  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage1_v2_ddp2/encoder_step50000.pt
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage1_v3_fleurs/encoder_step100000.pt
   dropout_p: 0.1
   attn_dropout_p: 0.1
   ffn_inner_dropout_p: 0.1
@@ -38,13 +47,14 @@ ctc_compress:
   blank_id: 0
 
 data:
-  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V4_16k.csv
-  val_index:   /ocean/projects/cis250145p/shared/ASR_INDEX_V4_16k.csv
+  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  val_index:   /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
   train_split: train
   val_split:   dev
   languages:   null   # null = all 22 languages in the index, matching Stage 1's scope
   max_duration: 20.0
   lowercase: true
+  sp_tokenizer_path: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
 
 training:
   task: transcribe
@@ -56,6 +66,7 @@ training:
   lora_rank: 0
 
   ctc_weight: 0.0           # required by build_model()'s omniasr_live guard
+  aux_ctc_weight: 0.3       # see header note above
 
   max_steps: 50000
   lr: 5.0e-5   # matches stage2.yaml / cached-smoke precedent
@@ -65,7 +76,8 @@ training:
   gamma: 0.5
   scheduler: cosine_warmup_restarts
   weight_decay: 0.01
-  grad_accum: 8   # halved for 2x DDP: world_size(2) * grad_accum(8) = same effective batch as 1-GPU grad_accum(16)
+  grad_accum: 4   # world_size(4) * grad_accum(4) = 16 effective microbatches/step — matches the
+                  # validated ablation's per-GPU setting (bs=4, grad_accum=4), just parallelized
 
   max_batch_duration: 20.0
   max_batch_size: 4

@@ -48,7 +48,7 @@ from st.data import (
 )
 from st.models.omniasr_encoder import build_omniasr_encoder_from_config
 from st.utils.config import load_config
-from st.utils.ddp_utils import setup_ddp, teardown_ddp, reduce_tensor, barrier
+from st.utils.ddp_utils import setup_ddp, teardown_ddp, barrier
 from st.utils.metrics import compute_wer
 from st.utils.schedulers import build_scheduler
 
@@ -368,6 +368,10 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
     use_wandb = not train_cfg.get("no_wandb", False)
     if master and use_wandb:
         try:
+            # See train_st.py's matching note: without WANDB_SILENT, wandb
+            # 0.21.3 crashes printing its login banner (TypeError on a null
+            # "flags" field). setdefault so no launcher can miss it.
+            os.environ.setdefault("WANDB_SILENT", "true")
             import wandb
             wandb.init(
                 project=train_cfg.get("wandb_project", "iwslt2026"),
@@ -378,6 +382,12 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
             )
             log.info(f"W&B: {wandb.run.url}")
         except ImportError:
+            use_wandb = False
+        except Exception as e:
+            # See train_st.py's matching handler: wandb.init() can crash on
+            # server-side responses it mishandles (a real TypeError hit this
+            # session). Remote logging must never take a training run down.
+            log.warning(f"wandb.init() failed, continuing without W&B logging: {e}")
             use_wandb = False
     elif not master:
         use_wandb = False
@@ -495,11 +505,17 @@ def train(cfg: dict, resume_from: str | None = None) -> None:
 
             # ---- Logging (master only, loss averaged across ranks) ----
             if global_step % log_every == 0 and run_n > 0 and micro_step % grad_accum == 0:
-                loss_for_log = loss.detach().clone()
-                reduce_tensor(loss_for_log)  # all ranks participate in the all-reduce
+                # Sum-then-divide across ranks' own (running_loss, run_n) so
+                # `avg` is the true global mean over this log_every window —
+                # not just master's own microbatches (the previous version
+                # reduced a throwaway single-step value and never used the
+                # result, so the logged loss was silently master-only).
+                stats = torch.tensor([running_loss, float(run_n)], dtype=torch.float64, device=device)
+                if is_ddp:
+                    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
                 if master:
-                    avg = running_loss / run_n
+                    avg = (stats[0] / stats[1]).item()
                     cur_lr = optimizer.param_groups[0]["lr"]
                     log.info(f"step {global_step}/{total_steps} | ctc_loss={avg:.4f} | "
                              f"lr={cur_lr:.2e} | bs={cur_bs} | dur={cur_dur:.0f}s | ep={epoch}")

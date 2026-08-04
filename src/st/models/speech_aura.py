@@ -506,6 +506,31 @@ class SpeechAura(nn.Module):
     # Inference
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _mask_repeated_ngrams(logits: torch.Tensor, generated: list[int], ngram_size: int) -> torch.Tensor:
+        """Ban whichever token would complete an n-gram already seen in `generated`.
+
+        Standard no-repeat-ngram decoding constraint (same technique HF's
+        `generate()` applies via NoRepeatNGramLogitsProcessor). Needed here
+        because this is a bespoke greedy loop with no such guard otherwise —
+        without it, generate() can degenerate into "word word word word..."
+        loops on hard/short/OOD inputs (observed on NCHLT single-word
+        utterances specifically) since greedy argmax has no mechanism to
+        break out of a self-reinforcing repeat once it starts.
+        """
+        if ngram_size <= 0 or len(generated) < ngram_size - 1:
+            return logits
+        prefix = tuple(generated[-(ngram_size - 1):]) if ngram_size > 1 else ()
+        banned = {
+            generated[i + ngram_size - 1]
+            for i in range(len(generated) - ngram_size + 1)
+            if tuple(generated[i:i + ngram_size - 1]) == prefix
+        }
+        if banned:
+            logits = logits.clone()
+            logits[:, list(banned)] = float("-inf")
+        return logits
+
     @torch.inference_mode()
     def generate(
         self,
@@ -513,6 +538,7 @@ class SpeechAura(nn.Module):
         audio_lengths: torch.Tensor,    # (1,)
         target_lang: str = "eng",
         max_new_tokens: int = 256,
+        no_repeat_ngram_size: int = 3,
     ) -> str:
         """Autoregressive decoding with KV cache."""
         from st.models.kvcache import KVcache
@@ -559,7 +585,8 @@ class SpeechAura(nn.Module):
             logits = self.aura.model.lm_head(h).float()
 
         generated  = []
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (1, 1)
+        logits = self._mask_repeated_ngrams(logits[:, -1, :], generated, no_repeat_ngram_size)
+        next_token = logits.argmax(dim=-1, keepdim=True)  # (1, 1)
 
         for step in range(max_new_tokens):
             tok = int(next_token.item())
@@ -575,7 +602,8 @@ class SpeechAura(nn.Module):
                     h = layer(h, position_ids=pos, use_cache=True, cache=cache)
                 h      = self.aura.model.model.norm(h)
                 logits = self.aura.model.lm_head(h).float()
-            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            logits = self._mask_repeated_ngrams(logits[:, -1, :], generated, no_repeat_ngram_size)
+            next_token = logits.argmax(dim=-1, keepdim=True)
 
         return self.aura.tokenizer.decode(generated, skip_special_tokens=True)
 
@@ -587,6 +615,7 @@ class SpeechAura(nn.Module):
         audio_lengths: torch.Tensor,   # (1,)
         target_lang: str = "eng",
         max_new_tokens: int = 256,
+        no_repeat_ngram_size: int = 3,
     ) -> str:
         """Same as generate(), but for precomputed encoder features."""
         from st.models.kvcache import KVcache
@@ -633,7 +662,8 @@ class SpeechAura(nn.Module):
             logits = self.aura.model.lm_head(h).float()
 
         generated  = []
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (1, 1)
+        logits = self._mask_repeated_ngrams(logits[:, -1, :], generated, no_repeat_ngram_size)
+        next_token = logits.argmax(dim=-1, keepdim=True)  # (1, 1)
 
         for step in range(max_new_tokens):
             tok = int(next_token.item())
@@ -649,7 +679,8 @@ class SpeechAura(nn.Module):
                     h = layer(h, position_ids=pos, use_cache=True, cache=cache)
                 h      = self.aura.model.model.norm(h)
                 logits = self.aura.model.lm_head(h).float()
-            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            logits = self._mask_repeated_ngrams(logits[:, -1, :], generated, no_repeat_ngram_size)
+            next_token = logits.argmax(dim=-1, keepdim=True)
 
         return self.aura.tokenizer.decode(generated, skip_special_tokens=True)
 

@@ -1,0 +1,85 @@
+# Stage 2 v2: identical to stage2_v2.yaml (V100x4 variant) except hardware —
+# this one targets 2x H100-80 (grad_accum=8 x world_size(2) = 16 effective
+# microbatches/step, same target as the V100 variant's 4x4). Separate
+# output_dir/wandb_run_name so the two don't collide.
+#
+# aux_ctc_weight=0.3: auxiliary CTC loss on the projector's own
+# (pre-compression) output — see speech_aura.py's aux_ctc_head block. Matches
+# ESPnet's hybrid CTC/attention default; empirically validated on this model
+# via a paired 3000-step ablation (~16% lower val WER vs aux_ctc_weight=0.0).
+#
+# Must run under .envs/omniasr_extract (torch==2.8.0+cu128), not Aura_base/env.
+
+encoder:
+  type: omniasr_live
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage1_v3_fleurs/encoder_step100000.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: true   # moot — encoder is frozen below anyway
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg        # only strategy that needs no gradient through ctc_logits
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  val_index:   /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  train_split: train
+  val_split:   dev
+  languages:   null   # null = all 22 languages in the index, matching Stage 1's scope
+  max_duration: 20.0
+  lowercase: true
+  sp_tokenizer_path: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
+
+training:
+  task: transcribe
+  output_dir: runs/stage2_v2_h100
+  val_samples_per_lang: 30
+
+  unfreeze_encoder: false   # frozen — this IS the "Stage 2" semantic (only projector trains)
+  unfreeze_llm: false
+  lora_rank: 0
+
+  ctc_weight: 0.0           # required by build_model()'s omniasr_live guard
+  aux_ctc_weight: 0.3       # see header note above
+
+  max_steps: 50000
+  lr: 5.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+  first_cycle_steps: 50000
+  gamma: 0.5
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 8   # world_size(2) * grad_accum(8) = 16 effective microbatches/step
+
+  max_batch_duration: 20.0
+  max_batch_size: 4
+  max_seq_len: 1024
+  num_workers: 4
+
+  log_every: 20
+  save_every: 2500
+  eval_every: 2500
+  val_max_batches: 50   # dev split is 120k+ examples — full pass every eval is too slow
+
+  no_wandb: false
+  wandb_project: aura-mt
+  wandb_entity: etanghan-carnegie-mellon-university
+  wandb_run_name: stage2_v2_h100

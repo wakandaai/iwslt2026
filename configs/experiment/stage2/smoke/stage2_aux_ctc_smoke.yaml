@@ -1,0 +1,72 @@
+# Correctness smoke test for aux_ctc_weight (CTC loss on the projector's own
+# output, distinct from the encoder-level ctc_weight). Single GPU, ~20 steps —
+# just confirms no crash/NaN and gradients reach the projector.
+# Not meant to show training benefit — see configs/experiment/stage2/ablation/.
+
+encoder:
+  type: omniasr_live
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage1_v3_fleurs/encoder_step100000.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: true
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  val_index:   null   # no val pass needed for this smoke test
+  train_split: train
+  languages:   null
+  max_duration: 20.0
+  lowercase: true
+  sp_tokenizer_path: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
+
+training:
+  task: transcribe
+  output_dir: runs/stage2_aux_ctc_smoke
+
+  unfreeze_encoder: false
+  unfreeze_llm: false
+  lora_rank: 0
+
+  ctc_weight: 0.0
+  aux_ctc_weight: 0.3   # arbitrary starting value for this smoke test only
+
+  max_steps: 20
+  lr: 5.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 5
+  first_cycle_steps: 20
+  gamma: 1.0
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 2
+
+  max_batch_duration: 20.0
+  max_batch_size: 4
+  max_seq_len: 1024
+  num_workers: 2
+
+  log_every: 1
+  save_every: 1000000   # don't save during a correctness smoke test
+  eval_every: 1000000   # no val_index anyway
+
+  no_wandb: true

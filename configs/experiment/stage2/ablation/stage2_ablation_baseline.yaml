@@ -1,0 +1,79 @@
+# Paired ablation, arm A: aux_ctc_weight=0.0 (baseline). Byte-identical to
+# stage2_ablation_aux_ctc.yaml except aux_ctc_weight/wandb_run_name — checks
+# whether the aux CTC loss actually helps before committing to the full
+# Stage 2 v2 run. 3000 steps, single V100. Compare val/ce_loss + val/wer in
+# wandb (project aura-mt).
+
+encoder:
+  type: omniasr_live
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage1_v3_fleurs/encoder_step100000.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: true
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  val_index:   /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  train_split: train
+  val_split:   dev
+  languages:   null
+  max_duration: 20.0
+  lowercase: true
+  sp_tokenizer_path: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
+
+training:
+  task: transcribe
+  output_dir: runs/stage2_ablation_baseline
+  val_samples_per_lang: 3   # keep generation-eval cost bounded at eval_every=500
+
+  unfreeze_encoder: false
+  unfreeze_llm: false
+  lora_rank: 0
+
+  ctc_weight: 0.0
+  aux_ctc_weight: 0.0       # <-- the only substantive difference vs the "on" arm
+
+  max_steps: 3000
+  lr: 5.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 150
+  first_cycle_steps: 3000
+  gamma: 1.0
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 4
+
+  max_batch_duration: 20.0
+  max_batch_size: 4
+  max_seq_len: 1024
+  num_workers: 4
+
+  log_every: 10
+  save_every: 3000
+  eval_every: 500
+  val_max_batches: 30
+
+  no_wandb: false
+  wandb_project: aura-mt
+  wandb_entity: etanghan-carnegie-mellon-university
+  wandb_run_name: stage2_ablation_baseline

@@ -560,6 +560,29 @@ attribute name) that needed stripping/dropping before the raw fairseq2 model's `
 would accept it. Batch settings in the new config are a reasoned-not-validated guess — no smoke test
 has been run yet.
 
+**Update (2026-07-21) — first real run, two more bugs found:**
+
+The `_build_and_load()` fix above had only ever been applied to this repo's snapshot, never
+back-ported to the original `iwslt2026` checkout that actually submits jobs — so the first real
+Stage 2 job crashed with the exact `RuntimeError: Error(s) in loading state_dict` the fix was
+supposed to prevent. Audited the full `src/st/` tree for drift between the two repos and found 11
+files with fixes that had never been synced back (`omniasr_encoder.py`, `llama3.py` — which had a
+second latent bug, `from kvcache import KVcache` instead of `from st.models.kvcache import KVcache`
+inside `generate()` — plus `aura.py`, `encoder.py`, `kvcache.py`, `model_factory.py`, `projector.py`,
+`speech_aura.py`, `pretrain_ctc.py`, `train_st.py`, `generate.py`). Synced all of them.
+
+Second bug, more serious: `evaluate()` in `train_st.py` computed validation loss over the *entire*
+dev split (120,960 examples / 283.4h) on every `eval_every` trigger — `val_samples_per_lang` only
+bounded the 660-sample generation loop, not the loss loop. Harmless for Stage 1 (cheap CTC-only
+forward, no LLM) but Stage 2's full `encoder→compressor→projector→LLM` forward per example made
+this take long enough to look like a hang (30+ min of silence, confirmed the process was alive at
+91.9% CPU, not deadlocked) — likely hours per validation, ×100 over the run. Fixed by adding
+`val_max_batches` (default 50), threaded through both `evaluate()` call sites; added explicitly to
+`stage2_v1.yaml`/`stage3_v1.yaml`/`stage4_v1.yaml` for clarity.
+
+Also bumped `max_steps`/`first_cycle_steps` 5000→50000 — 5k steps isn't enough to properly train
+the projector from scratch, matching the scale of Stage 1's own step count.
+
 ---
 
 ### Stage 3: Aura-1B LoRA Fine-tuning (Encoder Frozen)
@@ -793,5 +816,86 @@ The CTC Compressor + Transformer Projector approach is more compute-intensive at
 | Stage 4 (3k steps) | 4–8× | 4–6h |
 
 Minimum viable: 8× A100 with `grad_accumulation.num_batches: 8` for Stage 1.
+
+---
+
+## 11. Post-Stage4/5 roadmap: what it takes to actually beat SOTA (2026-08-06)
+
+**Status as of this writing.** Stage4-LLM (`stage4_v1_step45000`) is true row-level SOTA
+(beats every baseline — Conform./MMS-1B/Seamless/OmniASR-LLM/Whisper-v3/Aura-ASR-v1) on
+only **3 of 27** `stt_bench` cells: FLEURS Amharic, FLEURS Kinyarwanda, NCHLT Sesotho. It
+beats Aura-ASR-v1 specifically on 15/27 but loses on 12/27, concentrated almost entirely
+in WAXAL (5/6 languages) and several FLEURS Bantu languages. Stage 5 (full unfreeze,
+`stage4_v1_batch`/`stage5_v1_step40000`) is showing real, non-marginal gains over Stage 4
+in real `stt_bench` evaluation — 12/12 FLEURS cells checked so far beat Stage4-LLM, by as
+much as 4+ points (Zulu, Xhosa) — but it's the same underlying data and domain mix, not a
+different regime.
+
+**Bottom line: full 27/27 SOTA is not realistically reachable with the current data/recipe.
+A specific, evidence-backed subset of it is.** The problem splits into two genuinely
+different fights that need different solutions — conflating them wastes compute on the
+less winnable one.
+
+### Fight 1 — resource-rich languages (English, French, Portuguese, Arabic): not worth chasing
+
+Seamless/MMS/OmniASR-LLM sit at 3–10% WER here; we're at 12–16%. That's a 2–4x gap against
+systems trained on web-scale multilingual data far beyond our ~19,800-hour set. No amount
+of more steps or modest data additions on our current recipe closes a gap that's
+fundamentally about data-scale order-of-magnitude — and it's outside this project's actual
+mission (IWSLT low-resource African track) anyway. **Recommendation: do not spend compute
+budget trying to win these cells.**
+
+### Fight 2 — low-resource African languages: where the real, provable edge is
+
+This is where the project's actual advantage lives, and where the evidence points to
+concrete, already-validated fixes:
+
+1. **Targeted data augmentation for NCHLT + BembaSpeech, mirroring the FLEURS-augmentation
+   playbook that already worked once** (§3, V4→V5). Real training-data source distribution
+   (checked directly against `ASR_INDEX_V5_16k.csv`): NCHLT is 0.83% of training,
+   BembaSpeech is 0.16% — both *more* starved than FLEURS was (~0.1%) before that fix
+   measurably helped 11/14 regressed rows. This is the single highest-confidence, cheapest
+   lever available — not a hypothesis, a repeat of something already proven in this exact
+   project.
+
+2. **Extend Stage 5's LR schedule properly and let it run further** —
+   `first_cycle_steps: 150000–200000`, not just a bigger `max_steps`. The current
+   `cosine_warmup_restarts` schedule (`first_cycle_steps: 50000`) is already collapsed to
+   near-`min_lr` (6.85e-7 by step 42500, vs. peak 1.0e-5) — naively extending `max_steps`
+   on the same schedule trains at ~zero effective LR and wastes GPU time. Real internal
+   precedent: Stage 1's own encoder went 34.98%→33.70% WER from 50k→100k steps on the same
+   data (`omni_ctc_v2_50k` → `omni_ctc_v3_fleurs_100k`). Epoch-coverage math (weighted
+   `beta_language=0.7` sampling, real per-language row counts) confirms real headroom:
+   even the smallest-data language (Portuguese, 40,323 rows) hasn't completed 1 full epoch
+   by step 50k (0.51 effective epochs); English is at 0.16.
+
+3. **Investigate WAXAL specifically — don't just add data blindly.** WAXAL is already a
+   reasonable 7.29% of training (not obviously starved like NCHLT/FLEURS/BembaSpeech), yet
+   Aura-ASR-v1 beats us on 5/6 WAXAL languages consistently. That's not explained by the
+   same "underrepresented domain" story as the other three. Before spending a training
+   cycle on more WAXAL data, diagnose *why* Aura-ASR-v1 wins there first (transcript
+   quality in our WAXAL subset? a training-recipe difference specific to that domain?) —
+   this is the one open question in this whole analysis without a validated answer yet,
+   only a real, repeated pattern to explain.
+
+4. **Malagasy, Shona, Lingala are a distinct, smaller problem** — flat or getting *worse*
+   over 40k Stage 5 training steps despite the model improving broadly (real per-language
+   val/WER logged: Malagasy 40.09%→40.87%, Shona 38.41%→38.91%, Lingala 39.61%→39.91%,
+   steps 2500→42500). Malagasy's linguistic isolation (Austronesian, no Bantu relatives to
+   borrow transfer learning from — flagged independently in `stt_bench/analysis/common.py`'s
+   `LANG_INFO` typology table) is a plausible independent factor there; Shona/Lingala look
+   more like the same domain-starvation story as #1 above (both evaluated via WAXAL *and*
+   the FLEURS-starved 0.51% share).
+
+### Sequencing to actually run
+
+Steps 1 and 2 above aren't in conflict — build the NCHLT/BembaSpeech-augmented index (V6,
+following the V5 precedent in §1/§3.1) and launch the extended-schedule Stage 5 run against
+it in **one shot**, rather than two separate training cycles. Re-evaluate on real
+`stt_bench` afterward, then decide whether #3 (WAXAL investigation) is still the residual
+gap or whether it moved too. This is the fastest path to meaningfully growing the SOTA
+count beyond 3/27 on the languages where winning is actually achievable — not a promise of
+27/27, but a real, evidence-grounded next step rather than another blind hyperparameter
+pass.
 
 For constrained compute: start with `omniASR_CTC_300M` to validate the full pipeline end-to-end, then swap in the 1B checkpoint.

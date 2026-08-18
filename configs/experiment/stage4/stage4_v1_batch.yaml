@@ -1,0 +1,82 @@
+# Stage 4 batch variant: separate output_dir/wandb_run_name so this sbatch
+# job's checkpoints never collide with the interactive session running
+# against runs/stage4_v1_interactive. The .sbatch launcher resolves its
+# resume point across both directories at runtime.
+#
+# Unlike the interactive run, this also unfreezes the encoder (testing
+# whether the encoder itself is still a limiting factor once the LLM is
+# already adapting). lr lowered 5.0e-5 -> 1.0e-5 accordingly, since
+# encoder/LLM/projector all share one LR (no differential-LR support).
+
+encoder:
+  type: omniasr_live
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage1_v3_fleurs/encoder_step100000.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: true   # CTC head unused here (ctc_weight: 0.0), regardless of encoder freeze state
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  val_index:   /ocean/projects/cis250145p/shared/ASR_INDEX_V5_16k.csv
+  train_split: train
+  val_split:   dev
+  languages:   null   # null = all 22 languages, matching Stage 1/2/3's scope
+  max_duration: 20.0
+  lowercase: true
+  sp_tokenizer_path: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
+
+training:
+  task: transcribe
+  output_dir: runs/stage4_v1_batch
+  val_samples_per_lang: 30
+
+  unfreeze_encoder: true    # testing whether the encoder itself is still limiting
+  unfreeze_llm: true        # Stage 4's defining change: full LLM fine-tune
+  lora_rank: 0              # no adapters — must be 0 when unfreeze_llm: true
+
+  ctc_weight: 0.0           # required by build_model()'s omniasr_live guard
+  aux_ctc_weight: 0.3       # same regularization role as Stage 2/3
+
+  max_steps: 50000
+  lr: 1.0e-5          # lowered from 5.0e-5 — encoder is now unfrozen too, see header note
+  min_lr: 1.0e-7
+  warmup_steps: 2000
+  first_cycle_steps: 50000
+  gamma: 0.5
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 4
+  max_batch_duration: 50.0
+  max_batch_size: 12
+  max_seq_len: 1024
+  num_workers: 4
+
+  log_every: 20
+  save_every: 2500
+  eval_every: 2500
+  val_max_batches: 50
+
+  no_wandb: false
+  wandb_project: aura-mt
+  wandb_entity: etanghan-carnegie-mellon-university
+  wandb_run_name: stage4_v1_batch

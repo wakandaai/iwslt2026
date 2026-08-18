@@ -1,0 +1,86 @@
+# Stage 4 v2 batch: same architecture as stage4_v1_batch.yaml (encoder + LLM
+# both unfrozen), three changes based on the Stage 5 stt_bench deep-dive (see
+# docs/stage1_omniasr_ctc_guide.md §11):
+#   1. max_duration 20.0->30.0 — recovers WAXAL rows the old cutoff dropped
+#      (WAXAL averages 17-22s; up to 58% of some languages' rows were lost).
+#   2. train/val index -> ASR_INDEX_V6_16k.csv, which adds 196,084 real NCHLT
+#      rows for Zulu/Xhosa/Sesotho/Setswana (previously only Afrikaans was
+#      indexed from NCHLT). See .envs/scripts/build_nchlt_augment.py.
+#   3. max_steps/first_cycle_steps 50000->150000 — the old cosine cycle had
+#      already decayed to near min_lr well before plateauing.
+#
+# Resumes from stage4_v1_batch/checkpoint_step42500 — same architecture, so
+# optimizer.pt loads and the step count continues rather than resetting.
+
+encoder:
+  type: omniasr_live
+  checkpoint: /ocean/projects/cis250145p/tanghang/iwslt2026/runs/stage1_v3_fleurs/encoder_step100000.pt
+  dropout_p: 0.1
+  attn_dropout_p: 0.1
+  ffn_inner_dropout_p: 0.1
+  layer_drop_p: 0.0
+  final_dropout_p: 0.1
+  freeze_ctc_head: true   # CTC head unused here (ctc_weight: 0.0), regardless of encoder freeze state
+
+aura:
+  checkpoint: /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/model.pt
+  tokenizer:  /ocean/projects/cis250145p/shared/checkpoints/Aura-1B/tokenizer.json
+  size: 1b
+
+projector:
+  type: transformer
+  num_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+ctc_compress:
+  enabled: true
+  strategy: avg
+  remove_blanks: true
+  blank_id: 0
+
+data:
+  train_index: /ocean/projects/cis250145p/shared/ASR_INDEX_V6_16k.csv
+  val_index:   /ocean/projects/cis250145p/shared/ASR_INDEX_V6_16k.csv
+  train_split: train
+  val_split:   dev
+  languages:   null   # null = all 22 languages, matching Stage 1/2/3's scope
+  max_duration: 30.0  # raised from 20.0 — see header note 1
+  lowercase: true
+  sp_tokenizer_path: /ocean/projects/cis250145p/tanghang/iwslt2026/checkpoints/omniasr_ctc_1b/omniASR_tokenizer.model
+
+training:
+  task: transcribe
+  output_dir: runs/stage4_v2_batch
+  val_samples_per_lang: 30
+
+  unfreeze_encoder: true    # testing whether the encoder itself is still limiting
+  unfreeze_llm: true        # Stage 4's defining change: full LLM fine-tune
+  lora_rank: 0              # no adapters — must be 0 when unfreeze_llm: true
+
+  ctc_weight: 0.0           # required by build_model()'s omniasr_live guard
+  aux_ctc_weight: 0.3       # same regularization role as Stage 2/3
+
+  max_steps: 150000         # raised from 50000 — see header note 3
+  lr: 1.0e-5
+  min_lr: 1.0e-7
+  warmup_steps: 2000
+  first_cycle_steps: 150000 # raised from 50000 — see header note 3
+  gamma: 0.5
+  scheduler: cosine_warmup_restarts
+  weight_decay: 0.01
+  grad_accum: 4
+  max_batch_duration: 50.0
+  max_batch_size: 12
+  max_seq_len: 1024
+  num_workers: 4
+
+  log_every: 20
+  save_every: 2500
+  eval_every: 2500
+  val_max_batches: 50
+
+  no_wandb: false
+  wandb_project: aura-mt
+  wandb_entity: etanghan-carnegie-mellon-university
+  wandb_run_name: stage4_v2_batch
